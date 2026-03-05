@@ -30,6 +30,101 @@ use tokio::time::{interval, MissedTickBehavior};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+// ── Theme Engine ─────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct Theme {
+    bar_bg: Color,
+    bar_fg: Color,
+    sys_msg: Color,
+    timestamp: Color,
+    highlight_bg: Color,
+    highlight_fg: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            bar_bg: Color::Blue,
+            bar_fg: Color::White,
+            sys_msg: Color::Cyan,
+            timestamp: Color::DarkGray,
+            highlight_bg: Color::Magenta,
+            highlight_fg: Color::Black,
+        }
+    }
+}
+
+fn load_theme(requested_theme: &str) -> Theme {
+    let mut theme = Theme::default();
+    let config_path = "themes.ini";
+    
+    // Auto-generate themes.ini if it doesn't exist
+    if !std::path::Path::new(config_path).exists() {
+        let default_ini = r#"; irssi-tg Theme Configuration
+; You can use named colors (Blue, LightMagenta, DarkGray) or Hex codes (#1e1e2e)
+
+[default]
+bar_bg = Blue
+bar_fg = White
+sys_msg = Cyan
+timestamp = DarkGray
+highlight_bg = Magenta
+highlight_fg = Black
+
+[matrix]
+bar_bg = Black
+bar_fg = Green
+sys_msg = LightGreen
+timestamp = DarkGray
+highlight_bg = Green
+highlight_fg = Black
+
+[dracula]
+bar_bg = #282a36
+bar_fg = #f8f8f2
+sys_msg = #ff79c6
+timestamp = #6272a4
+highlight_bg = #ff5555
+highlight_fg = #f8f8f2
+"#;
+        let _ = fs::write(config_path, default_ini);
+    }
+
+    // Read and parse the target theme
+    if let Ok(contents) = fs::read_to_string(config_path) {
+        let mut in_target_theme = false;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') { continue; }
+            
+            if line.starts_with('[') && line.ends_with(']') {
+                let section = &line[1..line.len()-1];
+                in_target_theme = section == requested_theme;
+                continue;
+            }
+
+            if in_target_theme {
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    if let Ok(color) = val.parse::<Color>() {
+                        match key {
+                            "bar_bg" => theme.bar_bg = color,
+                            "bar_fg" => theme.bar_fg = color,
+                            "sys_msg" => theme.sys_msg = color,
+                            "timestamp" => theme.timestamp = color,
+                            "highlight_bg" => theme.highlight_bg = color,
+                            "highlight_fg" => theme.highlight_fg = color,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    theme
+}
+
 // ── irssi nick colour palette ─────────────────────────────────────────────────
 const NICK_COLORS: &[Color] = &[
     Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Red,
@@ -45,7 +140,7 @@ fn nick_color(name: &str) -> Color {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "irssi-style Telegram CLI")]
 struct Args {
-    /// Available themes: default, efnet, macintosh, matrix
+    /// Defined in themes.ini (e.g. default, matrix, dracula)
     #[arg(short, long, default_value = "default")]
     theme: String,
 }
@@ -88,10 +183,11 @@ struct App {
     all_chats: HashMap<String, grammers_client::peer::Peer>,
     ordered_chats: Vec<(String, grammers_client::peer::Peer)>,
     tab: Option<TabState>,
+    theme: Theme,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(theme: Theme) -> Self {
         Self {
             windows: vec![],
             active: None,
@@ -100,6 +196,7 @@ impl App {
             all_chats: HashMap::new(),
             ordered_chats: vec![],
             tab: None,
+            theme,
         }
     }
 
@@ -247,7 +344,6 @@ impl App {
 
     fn reset_tab(&mut self) { self.tab = None; }
 
-    // ── Workspace Persistence Engine ──────────────────────────────────────────
     fn save_windows(&self) {
         if let Ok(mut f) = fs::File::create(".saved_windows.txt") {
             if let Some(ai) = self.active {
@@ -330,7 +426,7 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn draw_topic_bar(f: &mut Frame, app: &App, area: Rect) {
-    let bg = Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD);
+    let bg = Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg).add_modifier(Modifier::BOLD);
     let time_str = Local::now().format("%H:%M").to_string();
     let act: Vec<usize> = app.windows.iter().enumerate()
         .filter(|(_, w)| w.activity != WindowActivity::None)
@@ -356,7 +452,7 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
     if app.active.is_none() && app.status_lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "No active window. /help for commands.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.timestamp),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
@@ -384,21 +480,21 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
     for _ in 0..padding { lines.push(Line::raw("")); }
 
     for l in src_vec.into_iter().skip(start_idx) {
-        let ts = Span::styled(format!("{} ", l.ts), Style::default().fg(Color::DarkGray));
+        let ts = Span::styled(format!("{} ", l.ts), Style::default().fg(app.theme.timestamp));
         if l.is_sys {
             lines.push(Line::from(vec![
                 ts,
-                Span::styled(format!("{} ", l.prefix), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(l.text.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{} ", l.prefix), Style::default().fg(app.theme.sys_msg).add_modifier(Modifier::BOLD)),
+                Span::styled(l.text.clone(), Style::default().fg(app.theme.sys_msg)),
             ]));
         } else if l.is_highlight {
             lines.push(Line::from(vec![
                 ts,
                 Span::styled(format!("{} {}", l.prefix, l.text),
-                    Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Style::default().fg(app.theme.highlight_fg).bg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)),
             ]));
         } else {
-            let col = l.nick.as_deref().map(nick_color).unwrap_or(Color::White);
+            let col = l.nick.as_deref().map(nick_color).unwrap_or(app.theme.bar_fg);
             lines.push(Line::from(vec![
                 ts,
                 Span::styled(format!("{} ", l.prefix), Style::default().fg(col).add_modifier(Modifier::BOLD)),
@@ -411,13 +507,13 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_window_bar(f: &mut Frame, app: &App, area: Rect) {
-    let bar_bg = Style::default().bg(Color::Blue).fg(Color::White);
+    let bar_bg = Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg);
     let mut spans: Vec<Span> = Vec::new();
 
     let status_style = if app.active.is_none() {
-        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::Blue).fg(Color::DarkGray)
+        Style::default().bg(app.theme.bar_bg).fg(app.theme.timestamp)
     };
     let status_marker = if app.active.is_none() { "*" } else { "" };
     spans.push(Span::styled(format!("[1{}(status)] ", status_marker), status_style));
@@ -431,13 +527,13 @@ fn draw_window_bar(f: &mut Frame, app: &App, area: Rect) {
         let unread = if w.unread > 0 && !is_active { format!("({})", w.unread) } else { String::new() };
         let label = format!("[{}{}{}{}] ", num, marker, w.name, unread);
         let style = if is_active {
-            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)
         } else if w.activity == WindowActivity::Highlight {
-            Style::default().bg(Color::Blue).fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            Style::default().bg(app.theme.bar_bg).fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)
         } else if w.activity == WindowActivity::Text {
-            Style::default().bg(Color::Blue).fg(Color::White)
+            Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg)
         } else {
-            Style::default().bg(Color::Blue).fg(Color::DarkGray)
+            Style::default().bg(app.theme.bar_bg).fg(app.theme.timestamp)
         };
         spans.push(Span::styled(label, style));
     }
@@ -459,11 +555,11 @@ fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
     });
 
     let mut spans = vec![
-        Span::styled(chan_prefix, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(chan_prefix, Style::default().fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)),
         Span::raw(app.input.clone()),
     ];
     if let Some(h) = &tab_hint {
-        spans.push(Span::styled(h.clone(), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(h.clone(), Style::default().fg(app.theme.timestamp)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -558,7 +654,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
         return Ok(());
     }
 
-// /names [chat]
+    // /names [chat]
     if let Some(rest) = text.strip_prefix("/names") {
         let target = rest.trim();
         let peer = if target.is_empty() {
@@ -572,9 +668,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             if let Some(p_ref) = p.to_ref().await {
                 let mut participants = client.iter_participants(p_ref);
                 let mut names = Vec::new();
-                
                 while let Ok(Some(part)) = participants.next().await {
-                    // Extract the first name, or fallback to username, or fallback to Unknown
                     let name_str = part.user.first_name()
                         .unwrap_or_else(|| part.user.username().unwrap_or("Unknown"))
                         .to_string();
@@ -582,7 +676,6 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                     names.push(name_str);
                     if names.len() >= 100 { names.push("...".to_string()); break; }
                 }
-                
                 app.push_sys(format!("-!- Names: {}", names.join(", ")));
             }
         } else {
@@ -781,7 +874,10 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
 #[tokio::main]
 async fn main() -> Result {
     dotenv().ok();
-    let _args = Args::parse();
+    let args = Args::parse();
+    
+    // Load config and instantiate App with theme
+    let theme = load_theme(&args.theme);
 
     let api_id: i32 = env::var("TG_API_ID").expect("TG_API_ID not set").parse().unwrap();
     let api_hash = env::var("TG_API_HASH").expect("TG_API_HASH not set");
@@ -801,7 +897,7 @@ async fn main() -> Result {
         client.sign_in(&token, code.trim()).await?;
     }
 
-    let mut app = App::new();
+    let mut app = App::new(theme);
     let mut dialogs = client.iter_dialogs();
     while let Ok(Some(dialog)) = dialogs.next().await {
         app.add_peer(dialog.peer().clone());
