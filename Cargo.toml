@@ -1,0 +1,17 @@
+[package]
+name = "rust-tg-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+grammers-client = "0.9"
+grammers-session = "0.9"
+grammers-mtsender = "0.9"
+tokio = { version = "1.0", features = ["full"] }
+dotenvy = "0.15"
+chrono = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+crossterm = { version = "0.27", features = ["event-stream"] }
+ratatui = "0.26"
+futures-util = "0.3"
+unicode-width = "0.1"
