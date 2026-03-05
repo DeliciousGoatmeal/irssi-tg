@@ -39,6 +39,8 @@ struct Theme {
     timestamp: Color,
     highlight_bg: Color,
     highlight_fg: Color,
+    text_fg: Color,             // NEW: Main message text color
+    nick_colors: Vec<Color>,    // NEW: Palette for hashing usernames
 }
 
 impl Default for Theme {
@@ -50,6 +52,11 @@ impl Default for Theme {
             timestamp: Color::DarkGray,
             highlight_bg: Color::Magenta,
             highlight_fg: Color::Black,
+            text_fg: Color::Reset,
+            nick_colors: vec![
+                Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Red,
+                Color::LightCyan, Color::LightGreen, Color::LightYellow, Color::LightMagenta, Color::LightRed,
+            ],
         }
     }
 }
@@ -58,7 +65,6 @@ fn load_theme(requested_theme: &str) -> Theme {
     let mut theme = Theme::default();
     let config_path = "themes.ini";
     
-    // Auto-generate themes.ini if it doesn't exist
     if !std::path::Path::new(config_path).exists() {
         let default_ini = r#"; irssi-tg Theme Configuration
 ; You can use named colors (Blue, LightMagenta, DarkGray) or Hex codes (#1e1e2e)
@@ -70,6 +76,8 @@ sys_msg = Cyan
 timestamp = DarkGray
 highlight_bg = Magenta
 highlight_fg = Black
+text_fg = Reset
+nick_colors = Cyan, Green, Yellow, Magenta, Red, LightCyan, LightGreen, LightYellow, LightMagenta, LightRed
 
 [matrix]
 bar_bg = Black
@@ -78,6 +86,8 @@ sys_msg = LightGreen
 timestamp = DarkGray
 highlight_bg = Green
 highlight_fg = Black
+text_fg = Green
+nick_colors = Green, LightGreen
 
 [dracula]
 bar_bg = #282a36
@@ -86,11 +96,12 @@ sys_msg = #ff79c6
 timestamp = #6272a4
 highlight_bg = #ff5555
 highlight_fg = #f8f8f2
+text_fg = #f8f8f2
+nick_colors = #8be9fd, #50fa7b, #ffb86c, #ff79c6, #bd93f9, #ff5555, #f1fa8c
 "#;
         let _ = fs::write(config_path, default_ini);
     }
 
-    // Read and parse the target theme
     if let Ok(contents) = fs::read_to_string(config_path) {
         let mut in_target_theme = false;
         for line in contents.lines() {
@@ -107,6 +118,17 @@ highlight_fg = #f8f8f2
                 if let Some((k, v)) = line.split_once('=') {
                     let key = k.trim();
                     let val = v.trim();
+                    
+                    if key == "nick_colors" {
+                        let parsed_colors: Vec<Color> = val.split(',')
+                            .filter_map(|s| s.trim().parse::<Color>().ok())
+                            .collect();
+                        if !parsed_colors.is_empty() {
+                            theme.nick_colors = parsed_colors;
+                        }
+                        continue;
+                    }
+
                     if let Ok(color) = val.parse::<Color>() {
                         match key {
                             "bar_bg" => theme.bar_bg = color,
@@ -115,6 +137,7 @@ highlight_fg = #f8f8f2
                             "timestamp" => theme.timestamp = color,
                             "highlight_bg" => theme.highlight_bg = color,
                             "highlight_fg" => theme.highlight_fg = color,
+                            "text_fg" => theme.text_fg = color,
                             _ => {}
                         }
                     }
@@ -123,17 +146,6 @@ highlight_fg = #f8f8f2
         }
     }
     theme
-}
-
-// ── irssi nick colour palette ─────────────────────────────────────────────────
-const NICK_COLORS: &[Color] = &[
-    Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Red,
-    Color::LightCyan, Color::LightGreen, Color::LightYellow, Color::LightMagenta, Color::LightRed,
-];
-
-fn nick_color(name: &str) -> Color {
-    let hash: usize = name.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize));
-    NICK_COLORS[hash % NICK_COLORS.len()]
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -494,11 +506,21 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(app.theme.highlight_fg).bg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)),
             ]));
         } else {
-            let col = l.nick.as_deref().map(nick_color).unwrap_or(app.theme.bar_fg);
+            // Apply the theme's hashing palette to the username
+            let col = l.nick.as_deref().map(|name| {
+                let hash: usize = name.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize));
+                if app.theme.nick_colors.is_empty() {
+                    app.theme.bar_fg
+                } else {
+                    app.theme.nick_colors[hash % app.theme.nick_colors.len()]
+                }
+            }).unwrap_or(app.theme.bar_fg);
+            
             lines.push(Line::from(vec![
                 ts,
                 Span::styled(format!("{} ", l.prefix), Style::default().fg(col).add_modifier(Modifier::BOLD)),
-                Span::raw(l.text.clone()),
+                // Apply the theme's text color to standard messages
+                Span::styled(l.text.clone(), Style::default().fg(app.theme.text_fg)),
             ]));
         }
     }
@@ -556,7 +578,7 @@ fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
 
     let mut spans = vec![
         Span::styled(chan_prefix, Style::default().fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)),
-        Span::raw(app.input.clone()),
+        Span::styled(app.input.clone(), Style::default().fg(app.theme.text_fg)),
     ];
     if let Some(h) = &tab_hint {
         spans.push(Span::styled(h.clone(), Style::default().fg(app.theme.timestamp)));
@@ -876,7 +898,6 @@ async fn main() -> Result {
     dotenv().ok();
     let args = Args::parse();
     
-    // Load config and instantiate App with theme
     let theme = load_theme(&args.theme);
 
     let api_id: i32 = env::var("TG_API_ID").expect("TG_API_ID not set").parse().unwrap();
@@ -957,7 +978,6 @@ async fn main() -> Result {
             maybe_ev = ev.next() => {
                 if let Some(Ok(CEvent::Key(key_ev))) = maybe_ev {
                     
-                    // Windows double-press bug fix
                     if key_ev.kind != KeyEventKind::Press {
                         continue;
                     }
