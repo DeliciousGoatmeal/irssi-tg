@@ -2,7 +2,7 @@ use unicode_width::UnicodeWidthStr;
 use chrono::Local;
 use clap::Parser;
 use crossterm::{
-    event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -21,6 +21,7 @@ use ratatui::{
 use std::{
     collections::{HashMap, VecDeque},
     env,
+    fs,
     io::{self, Write},
     sync::Arc,
     time::Duration,
@@ -29,6 +30,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+// ── irssi nick colour palette ─────────────────────────────────────────────────
 const NICK_COLORS: &[Color] = &[
     Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Red,
     Color::LightCyan, Color::LightGreen, Color::LightYellow, Color::LightMagenta, Color::LightRed,
@@ -39,13 +41,16 @@ fn nick_color(name: &str) -> Color {
     NICK_COLORS[hash % NICK_COLORS.len()]
 }
 
+// ── CLI ───────────────────────────────────────────────────────────────────────
 #[derive(Parser, Debug)]
 #[command(author, version, about = "irssi-style Telegram CLI")]
 struct Args {
+    /// Available themes: default, efnet, macintosh, matrix
     #[arg(short, long, default_value = "default")]
     theme: String,
 }
 
+// ── Data model ────────────────────────────────────────────────────────────────
 #[derive(Clone)]
 struct ChatLine {
     ts: String,
@@ -241,6 +246,18 @@ impl App {
     }
 
     fn reset_tab(&mut self) { self.tab = None; }
+
+    // ── Workspace Persistence Engine ──────────────────────────────────────────
+    fn save_windows(&self) {
+        if let Ok(mut f) = fs::File::create(".saved_windows.txt") {
+            if let Some(ai) = self.active {
+                let _ = writeln!(f, "ACTIVE={}", ai);
+            }
+            for w in &self.windows {
+                let _ = writeln!(f, "{}", w.name);
+            }
+        }
+    }
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -341,17 +358,30 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
             "No active window. /help for commands.",
             Style::default().fg(Color::DarkGray),
         )));
+        f.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
     }
 
     let h = area.height as usize;
     let w = area.width.max(1) as usize;
     let mut total_lines = 0usize;
     let mut start_idx = 0usize;
+    
     for (i, l) in src_vec.iter().enumerate().rev() {
-        let char_count = l.ts.len() + 1 + l.prefix.len() + 1 + l.text.chars().count();
-        total_lines += (char_count / w) + 1;
-        if total_lines >= h { start_idx = i; break; }
+        let plain_prefix = format!("{} {} ", l.ts, l.prefix);
+        let text_len = UnicodeWidthStr::width(plain_prefix.as_str()) + UnicodeWidthStr::width(l.text.as_str());
+        let lines_for_this_msg = if text_len == 0 { 1 } else { (text_len.saturating_sub(1) / w) + 1 };
+        
+        if total_lines + lines_for_this_msg > h {
+            start_idx = i + 1;
+            break; 
+        }
+        total_lines += lines_for_this_msg;
+        start_idx = i;
     }
+
+    let padding = h.saturating_sub(total_lines);
+    for _ in 0..padding { lines.push(Line::raw("")); }
 
     for l in src_vec.into_iter().skip(start_idx) {
         let ts = Span::styled(format!("{} ", l.ts), Style::default().fg(Color::DarkGray));
@@ -450,6 +480,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
     if text.is_empty() { return Ok(()); }
 
     if text == "/quit" || text.starts_with("/quit ") {
+        app.save_windows();
         std::process::exit(0);
     }
 
@@ -472,6 +503,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                 let _ = load_history(client, app, idx, 100).await;
             }
         }
+        app.save_windows();
         return Ok(());
     }
 
@@ -506,12 +538,13 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                     if a > idx { app.active = Some(a - 1); }
                 }
                 app.push_sys(format!("-!- Closed: {}", name));
+                app.save_windows();
             }
         }
         return Ok(());
     }
 
-    // /list [query]  — collect first to avoid borrow conflict
+    // /list [query]
     if let Some(rest) = text.strip_prefix("/list") {
         let q = rest.trim().to_lowercase();
         let mut out = vec!["-!- Channel List:".to_string()];
@@ -525,7 +558,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
         return Ok(());
     }
 
-    // /names [chat]
+// /names [chat]
     if let Some(rest) = text.strip_prefix("/names") {
         let target = rest.trim();
         let peer = if target.is_empty() {
@@ -539,13 +572,17 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             if let Some(p_ref) = p.to_ref().await {
                 let mut participants = client.iter_participants(p_ref);
                 let mut names = Vec::new();
+                
                 while let Ok(Some(part)) = participants.next().await {
+                    // Extract the first name, or fallback to username, or fallback to Unknown
                     let name_str = part.user.first_name()
                         .unwrap_or_else(|| part.user.username().unwrap_or("Unknown"))
                         .to_string();
+                        
                     names.push(name_str);
                     if names.len() >= 100 { names.push("...".to_string()); break; }
                 }
+                
                 app.push_sys(format!("-!- Names: {}", names.join(", ")));
             }
         } else {
@@ -650,6 +687,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                 app.push_sys(format!("-!- Joining: {}", nm));
                 let _ = load_history(client, app, idx, 100).await;
             }
+            app.save_windows();
         } else {
             app.push_sys("-!- No match. /search <name> first.");
         }
@@ -698,9 +736,9 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             "    /join <name>            open window  [Tab completes]",
             "    /msg <name> [text]      open & optionally send  [Tab completes]",
             "    /privmsg /query         aliases for /msg",
-            "    /whois <name>           show user info",
+            "    /whois <name>           show user info  [Tab completes]",
             "    /me <action>            action in current window",
-            "    /trout <name>           slap with a trout",
+            "    /trout <name>           slap with a trout  [Tab completes]",
             "    /win [N]                list or switch windows (1=status)",
             "    /close [N]              close window",
             "    /reload                 re-fetch last 100 messages",
@@ -772,6 +810,28 @@ async fn main() -> Result {
     app.push_status_sys(format!("irssi-tg ready — {} contacts cached.", app.ordered_chats.len()));
     app.push_status_sys("/help for commands  |  Tab completes names in /join and /msg");
 
+    // --- WORKSPACE RESTORE ENGINE ---
+    if let Ok(contents) = fs::read_to_string(".saved_windows.txt") {
+        let mut active_idx = None;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Some(idx_str) = line.strip_prefix("ACTIVE=") {
+                active_idx = idx_str.parse::<usize>().ok();
+                continue;
+            }
+            if let Some(peer) = app.all_chats.get(&line.to_lowercase()) {
+                app.focus_window(peer.clone());
+            }
+        }
+        if !app.windows.is_empty() {
+            let ai = active_idx.unwrap_or(0).min(app.windows.len() - 1);
+            app.active = Some(ai);
+            let _ = load_history(&client, &mut app, ai, 100).await;
+            app.push_status_sys(format!("Restored {} open windows from last session.", app.windows.len()));
+        }
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -799,9 +859,18 @@ async fn main() -> Result {
             }
 
             maybe_ev = ev.next() => {
-                if let Some(Ok(CEvent::Key(KeyEvent { code, modifiers, .. }))) = maybe_ev {
-                    match (code, modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                if let Some(Ok(CEvent::Key(key_ev))) = maybe_ev {
+                    
+                    // Windows double-press bug fix
+                    if key_ev.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    match (key_ev.code, key_ev.modifiers) {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            app.save_windows();
+                            break Ok(());
+                        },
                         (KeyCode::Enter, _) => {
                             app.reset_tab();
                             let line = std::mem::take(&mut app.input);
