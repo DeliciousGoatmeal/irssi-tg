@@ -33,9 +33,10 @@ Next, you need your API keys. Go to the Telegram dev website and get your api_id
 TG_API_ID=1337
 TG_API_HASH=ur_secret_hash_goes_here_xD
 ```
-Then, just compile it! (Warning: might take a min on a dial-up connection jk)Bashcargo build --release
+Then, just compile it! (Warning: might take a min on a dial-up connection jk)
 ```
-./target/release/rust-tg-cli --theme dracula
+cargo build --release
+./target/release/irssi-tg --theme dracula
 ```
 <hr>🎮 ~ H0w 2 Us3 ~ 🎮Once you log in (it sends a code to your phone, pretty high-tech stuff), you'll see the command prompt.Here are the l33t commands u need to know to rule the chatroom:CommandWut it does/chats or /listShows u who u can talk to./join <name>Opens a chat window. PROTIP: hit <TAB> to auto-complete!/msg <name> <msg>Whispers a secret message to someone. shhh. :P/win <number>Switches between your open windows. /win 1 goes back to status./closeCloses your current tab./whois <name>Gets the 411 on a user. A/S/L?/trout <name>Trolls them with a fish./quitG2G, TTYL!<hr>🎨 ~ C0st0m1z3 (Th3m3s) ~ 🎨If the default colors are too boring, u can edit the themes.ini file! You can use hex codes just like styling your MySpace profile. It auto-generates the first time u run the app.Example:Ini, TOML[my_sweet_theme]
 bar_bg = #000000
