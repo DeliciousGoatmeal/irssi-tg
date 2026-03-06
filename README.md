@@ -25,7 +25,7 @@ I coded this entirely in Rust. It's an `irssi`-style terminal client for Telegra
 First, you gotta clone this repo to your rig. Open up your terminal (bash, cmd, whatever - just don't use WebTV lol) and type:
 
 ```bash
-git clone [https://github.com/your-username/xX_rust-tg-cli_Xx.git](https://github.com/your-username/xX_rust-tg-cli_Xx.git)
+git clone [https://github.com/DeliciousGoatmeal/xX_rust-tg-cli_Xx.git](https://github.com/DeliciousGoatmeal/xX_rust-tg-cli_Xx.git)
 cd xX_rust-tg-cli_Xx
 ```
 Next, you need your API keys. Go to the Telegram dev website and get your api_id and api_hash. Keep these secret! If u share them u will get pwned. >_<Make a hidden file called .env in the root folder like this:Code snippet
