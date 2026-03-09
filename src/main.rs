@@ -30,7 +30,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-// ── Theme Engine ──────────────────────────────────────────────────────────────
+// ── Theme Engine ─────────────────────────────────────────────────────────────
 #[derive(Clone)]
 struct Theme {
     bar_bg: Color,
@@ -39,8 +39,8 @@ struct Theme {
     timestamp: Color,
     highlight_bg: Color,
     highlight_fg: Color,
-    text_fg: Color,
-    nick_colors: Vec<Color>,
+    text_fg: Color,             
+    nick_colors: Vec<Color>,    
 }
 
 impl Default for Theme {
@@ -50,7 +50,7 @@ impl Default for Theme {
             bar_fg: Color::White,
             sys_msg: Color::Cyan,
             timestamp: Color::DarkGray,
-            highlight_bg: Color::Magenta,
+            highlight_bg: Color::Magenta, // Used for the colored text highlight
             highlight_fg: Color::Black,
             text_fg: Color::Reset,
             nick_colors: vec![
@@ -64,10 +64,10 @@ impl Default for Theme {
 fn load_theme(requested_theme: &str) -> Theme {
     let mut theme = Theme::default();
     let config_path = "themes.ini";
-
+    
     if !std::path::Path::new(config_path).exists() {
         let default_ini = r#"; irssi-tg Theme Configuration
-; Named colors (Blue, LightMagenta, DarkGray) or hex codes (#1e1e2e)
+; You can use named colors (Blue, LightMagenta, DarkGray) or Hex codes (#1e1e2e)
 
 [default]
 bar_bg = Blue
@@ -103,35 +103,43 @@ nick_colors = #8be9fd, #50fa7b, #ffb86c, #ff79c6, #bd93f9, #ff5555, #f1fa8c
     }
 
     if let Ok(contents) = fs::read_to_string(config_path) {
-        let mut in_target = false;
+        let mut in_target_theme = false;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') { continue; }
+            
             if line.starts_with('[') && line.ends_with(']') {
-                in_target = &line[1..line.len()-1] == requested_theme;
+                let section = &line[1..line.len()-1];
+                in_target_theme = section == requested_theme;
                 continue;
             }
-            if !in_target { continue; }
-            if let Some((k, v)) = line.split_once('=') {
-                let key = k.trim();
-                let val = v.trim();
-                if key == "nick_colors" {
-                    let parsed: Vec<Color> = val.split(',')
-                        .filter_map(|s| s.trim().parse::<Color>().ok())
-                        .collect();
-                    if !parsed.is_empty() { theme.nick_colors = parsed; }
-                    continue;
-                }
-                if let Ok(color) = val.parse::<Color>() {
-                    match key {
-                        "bar_bg"       => theme.bar_bg = color,
-                        "bar_fg"       => theme.bar_fg = color,
-                        "sys_msg"      => theme.sys_msg = color,
-                        "timestamp"    => theme.timestamp = color,
-                        "highlight_bg" => theme.highlight_bg = color,
-                        "highlight_fg" => theme.highlight_fg = color,
-                        "text_fg"      => theme.text_fg = color,
-                        _ => {}
+
+            if in_target_theme {
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    
+                    if key == "nick_colors" {
+                        let parsed_colors: Vec<Color> = val.split(',')
+                            .filter_map(|s| s.trim().parse::<Color>().ok())
+                            .collect();
+                        if !parsed_colors.is_empty() {
+                            theme.nick_colors = parsed_colors;
+                        }
+                        continue;
+                    }
+
+                    if let Ok(color) = val.parse::<Color>() {
+                        match key {
+                            "bar_bg" => theme.bar_bg = color,
+                            "bar_fg" => theme.bar_fg = color,
+                            "sys_msg" => theme.sys_msg = color,
+                            "timestamp" => theme.timestamp = color,
+                            "highlight_bg" => theme.highlight_bg = color,
+                            "highlight_fg" => theme.highlight_fg = color,
+                            "text_fg" => theme.text_fg = color,
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -141,16 +149,19 @@ nick_colors = #8be9fd, #50fa7b, #ffb86c, #ff79c6, #bd93f9, #ff5555, #f1fa8c
 }
 
 fn nick_color(name: &str, theme: &Theme) -> Color {
-    if theme.nick_colors.is_empty() { return theme.bar_fg; }
     let hash: usize = name.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize));
-    theme.nick_colors[hash % theme.nick_colors.len()]
+    if theme.nick_colors.is_empty() {
+        theme.bar_fg
+    } else {
+        theme.nick_colors[hash % theme.nick_colors.len()]
+    }
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 #[derive(Parser, Debug)]
 #[command(author, version, about = "irssi-style Telegram CLI")]
 struct Args {
-    /// Theme name defined in themes.ini (e.g. default, matrix, dracula)
+    /// Defined in themes.ini (e.g. default, matrix, dracula)
     #[arg(short, long, default_value = "default")]
     theme: String,
 }
@@ -270,68 +281,10 @@ impl App {
             return i;
         }
         let name = peer.name().unwrap_or("Unknown").to_string();
-        self.windows.push(Window {
-            peer, name, unread: 0, activity: WindowActivity::None, lines: VecDeque::new(),
-        });
+        self.windows.push(Window { peer, name, unread: 0, activity: WindowActivity::None, lines: VecDeque::new() });
         self.windows.len() - 1
     }
 
-    // ── Incoming message: always create window if new, mark activity ──────────
-    fn push_incoming(
-        &mut self,
-        from_peer: &grammers_client::peer::Peer,
-        ts: String,
-        nick: String,
-        text: String,
-        highlight: bool,
-    ) {
-        let chat_id = from_peer.id();
-        let line = ChatLine {
-            ts,
-            prefix: format!("<{}>", nick),
-            text,
-            is_sys: false,
-            is_highlight: highlight,
-            nick: Some(nick.clone()),
-        };
-
-        // Find existing window by peer ID, or fuzzy name match
-        let win_idx = self.windows.iter().position(|w| w.peer.id() == chat_id)
-            .or_else(|| {
-                let nick_lc = nick.to_lowercase();
-                self.windows.iter().position(|w| {
-                    let wn = w.name.to_lowercase();
-                    wn == nick_lc || wn.starts_with(&nick_lc) || nick_lc.starts_with(&wn)
-                })
-            });
-
-        let i = if let Some(i) = win_idx {
-            i
-        } else {
-            // Brand-new sender — open a window for them
-            self.add_peer(from_peer.clone());
-            let name = from_peer.name().unwrap_or("Unknown").to_string();
-            self.windows.push(Window {
-                peer: from_peer.clone(),
-                name,
-                unread: 0,
-                activity: WindowActivity::None,
-                lines: VecDeque::new(),
-            });
-            self.windows.len() - 1
-        };
-
-        let is_active = self.active == Some(i);
-        if !is_active {
-            let lvl = if highlight { WindowActivity::Highlight } else { WindowActivity::Text };
-            if lvl > self.windows[i].activity { self.windows[i].activity = lvl; }
-            self.windows[i].unread += 1;
-        }
-        self.windows[i].lines.push_back(line);
-        while self.windows[i].lines.len() > 2000 { self.windows[i].lines.pop_front(); }
-    }
-
-    // ── Tab completion ────────────────────────────────────────────────────────
     fn do_tab(&mut self) {
         let raw = self.input.clone();
         let (cmd_prefix, partial) = if let Some(r) = raw.strip_prefix("/join ") {
@@ -375,16 +328,13 @@ impl App {
 
     fn reset_tab(&mut self) { self.tab = None; }
 
-    // ── Session persistence ───────────────────────────────────────────────────
-    // Format: "ACTIVE=N" on first line, then "peer_id|peer_name" per window.
-    // peer_id is authoritative; name is a fallback for peers not yet in cache.
     fn save_windows(&self) {
         if let Ok(mut f) = fs::File::create(".saved_windows.txt") {
             if let Some(ai) = self.active {
                 let _ = writeln!(f, "ACTIVE={}", ai);
             }
             for w in &self.windows {
-                let _ = writeln!(f, "{}|{}", w.peer.id(), w.name);
+                let _ = writeln!(f, "{}", w.name);
             }
         }
     }
@@ -409,9 +359,7 @@ async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usi
         } else {
             (format!("<{}>", sender), Some(sender))
         };
-        app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: txt, is_sys: false, is_highlight: false, nick,
-        });
+        app.windows[win_idx].lines.push_back(ChatLine { ts, prefix, text: txt, is_sys: false, is_highlight: false, nick });
     }
     Ok(())
 }
@@ -436,9 +384,7 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
         } else {
             (format!("<{}>", sender), Some(sender))
         };
-        app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: txt, is_sys: false, is_highlight: false, nick,
-        });
+        app.windows[win_idx].lines.push_back(ChatLine { ts, prefix, text: txt, is_sys: false, is_highlight: false, nick });
         while app.windows[win_idx].lines.len() > 2000 { app.windows[win_idx].lines.pop_front(); }
     }
     Ok(())
@@ -487,9 +433,9 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
         app.status_lines.iter().collect()
     };
 
-    if src_vec.is_empty() {
+    if app.active.is_none() && app.status_lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No messages. /help for commands.",
+            "No active window. /help for commands.",
             Style::default().fg(app.theme.timestamp),
         )));
         f.render_widget(Paragraph::new(Text::from(lines)), area);
@@ -500,16 +446,20 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
     let w = area.width.max(1) as usize;
     let mut total_lines = 0usize;
     let mut start_idx = 0usize;
+    
     for (i, l) in src_vec.iter().enumerate().rev() {
-        let plain = format!("{} {} {}", l.ts, l.prefix, l.text);
-        let char_w = UnicodeWidthStr::width(plain.as_str());
-        let rendered = (char_w.saturating_sub(1) / w) + 1;
-        if total_lines + rendered > h { start_idx = i + 1; break; }
-        total_lines += rendered;
+        let plain_prefix = format!("{} {} ", l.ts, l.prefix);
+        let text_len = UnicodeWidthStr::width(plain_prefix.as_str()) + UnicodeWidthStr::width(l.text.as_str());
+        let lines_for_this_msg = if text_len == 0 { 1 } else { (text_len.saturating_sub(1) / w) + 1 };
+        
+        if total_lines + lines_for_this_msg > h {
+            start_idx = i + 1;
+            break; 
+        }
+        total_lines += lines_for_this_msg;
         start_idx = i;
     }
 
-    // Pad top so messages anchor to the bottom (irssi-style)
     let padding = h.saturating_sub(total_lines);
     for _ in 0..padding { lines.push(Line::raw("")); }
 
@@ -524,10 +474,9 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
         } else if l.is_highlight {
             lines.push(Line::from(vec![
                 ts,
-                Span::styled(
-                    format!("{} {}", l.prefix, l.text),
-                    Style::default().fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD),
-                ),
+                // Applied the text-color highlight without background modification
+                Span::styled(format!("{} {}", l.prefix, l.text),
+                    Style::default().fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)),
             ]));
         } else {
             let col = l.nick.as_deref().map(|n| nick_color(n, &app.theme)).unwrap_or(app.theme.bar_fg);
@@ -544,11 +493,7 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_window_bar(f: &mut Frame, app: &App, area: Rect) {
     let bar_bg = Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg);
-    let width = area.width as usize;
-
-    // Build all tab labels + styles up front
-    struct Tab { label: String, style: Style }
-    let mut all_tabs: Vec<Tab> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
 
     let status_style = if app.active.is_none() {
         Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)
@@ -556,81 +501,32 @@ fn draw_window_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().bg(app.theme.bar_bg).fg(app.theme.timestamp)
     };
     let status_marker = if app.active.is_none() { "*" } else { "" };
-    all_tabs.push(Tab {
-        label: format!("[1{}(status)] ", status_marker),
-        style: status_style,
-    });
+    spans.push(Span::styled(format!("[1{}(status)] ", status_marker), status_style));
 
     for (i, w) in app.windows.iter().enumerate() {
         let num = i + 2;
         let is_active = app.active == Some(i);
-        let marker = if is_active { "*" }
-                     else if w.activity != WindowActivity::None { "+" }
-                     else { "" };
+        
+        // Adds an asterisk if unread
+        let marker = if !is_active && w.unread > 0 { "*" } else { "" };
         let unread = if w.unread > 0 && !is_active { format!("({})", w.unread) } else { String::new() };
         let label = format!("[{}{}{}{}] ", num, marker, w.name, unread);
+        
         let style = if is_active {
             Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)
         } else if w.activity == WindowActivity::Highlight {
+            // Magenta Text, Blue Background!
             Style::default().bg(app.theme.bar_bg).fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)
         } else if w.activity == WindowActivity::Text {
             Style::default().bg(app.theme.bar_bg).fg(app.theme.bar_fg)
         } else {
             Style::default().bg(app.theme.bar_bg).fg(app.theme.timestamp)
         };
-        all_tabs.push(Tab { label, style });
+        spans.push(Span::styled(label, style));
     }
 
-    // Find which tab is active (0 = status, i+1 = window i)
-    let active_tab = app.active.map(|i| i + 1).unwrap_or(0);
-
-    // Figure out the scroll offset so the active tab is always visible.
-    // Walk backwards from the active tab until we run out of space.
-    let total_tabs = all_tabs.len();
-    let mut visible_end = active_tab + 1; // exclusive, always include active
-    let mut visible_start = active_tab;
-    let mut used = all_tabs[active_tab].label.len();
-
-    // Try to fill rightward first
-    while visible_end < total_tabs {
-        let next_w = all_tabs[visible_end].label.len();
-        if used + next_w > width { break; }
-        used += next_w;
-        visible_end += 1;
-    }
-    // Then fill leftward
-    while visible_start > 0 {
-        let prev_w = all_tabs[visible_start - 1].label.len();
-        if used + prev_w > width { break; }
-        used += prev_w;
-        visible_start -= 1;
-    }
-
-    // Scroll indicator prefix/suffix
-    let show_left  = visible_start > 0;
-    let show_right = visible_end < total_tabs;
-    let left_indicator  = if show_left  { "<" } else { "" };
-    let right_indicator = if show_right { ">" } else { "" };
-
-    let mut spans: Vec<Span> = Vec::new();
-    if show_left {
-        spans.push(Span::styled("<", Style::default().bg(app.theme.bar_bg).fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)));
-    }
-    for tab in &all_tabs[visible_start..visible_end] {
-        spans.push(Span::styled(tab.label.clone(), tab.style));
-    }
-    if show_right {
-        spans.push(Span::styled(">", Style::default().bg(app.theme.bar_bg).fg(app.theme.highlight_bg).add_modifier(Modifier::BOLD)));
-    }
-
-    // Pad remainder
-    let rendered: usize = left_indicator.len() + right_indicator.len()
-        + all_tabs[visible_start..visible_end].iter().map(|t| t.label.len()).sum::<usize>();
-    let pad = width.saturating_sub(rendered);
-    if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), bar_bg));
-    }
-
+    let used: usize = spans.iter().map(|s| s.content.len()).sum();
+    spans.push(Span::styled(" ".repeat((area.width as usize).saturating_sub(used)), bar_bg));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -655,7 +551,7 @@ fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
     let prefix_w = UnicodeWidthStr::width(format!("[{}] ", app.active_name()).as_str()) as u16;
-    let input_w  = UnicodeWidthStr::width(app.input.as_str()) as u16;
+    let input_w = UnicodeWidthStr::width(app.input.as_str()) as u16;
     let cx = (area.x + prefix_w + input_w).min(area.x + area.width.saturating_sub(1));
     f.set_cursor(cx, area.y);
 }
@@ -763,6 +659,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                     let name_str = part.user.first_name()
                         .unwrap_or_else(|| part.user.username().unwrap_or("Unknown"))
                         .to_string();
+                        
                     names.push(name_str);
                     if names.len() >= 100 { names.push("...".to_string()); break; }
                 }
@@ -785,7 +682,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
         let target = rest.trim();
         if let Some(key) = app.find_best_match_key(target) {
             let peer = app.all_chats[&key].clone();
-            let name  = peer.name().unwrap_or("Unknown").to_string();
+            let name = peer.name().unwrap_or("Unknown").to_string();
             let uname = peer.username().unwrap_or("none").to_string();
             app.push_sys(format!("-!- WHOIS {} (@{}) ID:{}", name, uname, peer.id()));
         } else {
@@ -808,7 +705,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                     PeerSearchItem::Dialog(p) => p,
                     PeerSearchItem::Global(p) => p,
                 };
-                let name  = peer.name().unwrap_or("Unknown").to_string();
+                let name = peer.name().unwrap_or("Unknown").to_string();
                 let uname = peer.username().unwrap_or("none").to_string();
                 app.push_sys(format!("  {} (@{})", name, uname));
                 app.add_peer(peer);
@@ -818,26 +715,26 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
     }
 
     // /join /msg /privmsg /query /trout
-    if text.starts_with("/join ")    || text.starts_with("/msg ")
-    || text.starts_with("/privmsg ") || text.starts_with("/query ")
-    || text.starts_with("/trout ")
+    if text.starts_with("/join ") || text.starts_with("/msg ")
+        || text.starts_with("/privmsg ") || text.starts_with("/query ")
+        || text.starts_with("/trout ")
     {
         let is_trout = text.starts_with("/trout ");
-        let is_msg   = text.starts_with("/msg ") || text.starts_with("/privmsg ") || text.starts_with("/query ");
-        let prefix_len = if text.starts_with("/join ")    { 6 }
-                    else if text.starts_with("/msg ")     { 5 }
-                    else if text.starts_with("/query ")   { 7 }
-                    else if text.starts_with("/trout ")   { 7 }
-                    else if text.starts_with("/privmsg ") { 9 }
+        let is_msg = text.starts_with("/msg ") || text.starts_with("/privmsg ") || text.starts_with("/query ");
+        let prefix_len = if text.starts_with("/join ")     { 6 }
+                    else if text.starts_with("/msg ")      { 5 }
+                    else if text.starts_with("/query ")    { 7 }
+                    else if text.starts_with("/trout ")    { 7 }
+                    else if text.starts_with("/privmsg ")  { 9 }
                     else { 0 };
         let rest = text[prefix_len..].trim();
 
         if let Some(key) = app.find_best_match_key(rest) {
-            let peer     = app.all_chats[&key].clone();
+            let peer = app.all_chats[&key].clone();
             let msg_text = rest[key.len()..].trim().to_string();
-            let idx      = app.focus_window(peer.clone());
-            app.active   = Some(idx);
-            app.windows[idx].unread   = 0;
+            let idx = app.focus_window(peer.clone());
+            app.active = Some(idx);
+            app.windows[idx].unread = 0;
             app.windows[idx].activity = WindowActivity::None;
             let nm = app.windows[idx].name.clone();
 
@@ -872,7 +769,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             }
             app.save_windows();
         } else {
-            app.push_sys("-!- No match. /search <n> first.");
+            app.push_sys("-!- No match. /search <name> first.");
         }
         return Ok(());
     }
@@ -880,9 +777,12 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
     // /me
     if let Some(rest) = text.strip_prefix("/me ") {
         if let Some(ai) = app.active {
-            let peer   = app.windows[ai].peer.clone();
+            let peer = app.windows[ai].peer.clone();
             let action = format!("* {} *", rest.trim());
-            let peer_ref = match peer.to_ref().await { Some(r) => r, None => return Ok(()) };
+            let peer_ref = match peer.to_ref().await {
+                Some(r) => r,
+                None => return Ok(()),
+            };
             client.send_message(peer_ref, action.clone()).await?;
             let ts = Local::now().format("%H:%M").to_string();
             app.windows[ai].lines.push_back(ChatLine {
@@ -913,12 +813,12 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             "    /search <query>         search contacts/chats",
             "    /list [query]           list cached dialogs",
             "    /names [chat]           list users in chat",
-            "    /join <n>            open window  [Tab completes]",
-            "    /msg <n> [text]      open & optionally send  [Tab completes]",
+            "    /join <name>            open window  [Tab completes]",
+            "    /msg <name> [text]      open & optionally send  [Tab completes]",
             "    /privmsg /query         aliases for /msg",
-            "    /whois <n>           show user info  [Tab completes]",
+            "    /whois <name>           show user info  [Tab completes]",
             "    /me <action>            action in current window",
-            "    /trout <n>           slap with a trout",
+            "    /trout <name>           slap with a trout  [Tab completes]",
             "    /win [N]                list or switch windows (1=status)",
             "    /close [N]              close window",
             "    /reload                 re-fetch last 100 messages",
@@ -936,7 +836,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
         return Ok(());
     }
 
-    // Plain text → send to active window
+    // Plain text → send
     if let Some(ai) = app.active {
         let peer = app.windows[ai].peer.clone();
         let peer_ref = match peer.to_ref().await {
@@ -950,7 +850,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             is_sys: false, is_highlight: false, nick: Some("You".to_string()),
         });
     } else {
-        app.push_sys("-!- No active window. /join <n> or /win 2");
+        app.push_sys("-!- No active window. /join <name> or /win 2");
     }
 
     Ok(())
@@ -962,6 +862,7 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
 async fn main() -> Result {
     dotenv().ok();
     let args = Args::parse();
+    
     let theme = load_theme(&args.theme);
 
     let api_id: i32 = env::var("TG_API_ID").expect("TG_API_ID not set").parse().unwrap();
@@ -983,8 +884,6 @@ async fn main() -> Result {
     }
 
     let mut app = App::new(theme);
-
-    // Load recent dialogs into peer cache
     let mut dialogs = client.iter_dialogs();
     while let Ok(Some(dialog)) = dialogs.next().await {
         app.add_peer(dialog.peer().clone());
@@ -993,46 +892,28 @@ async fn main() -> Result {
     app.push_status_sys(format!("irssi-tg ready — {} contacts cached.", app.ordered_chats.len()));
     app.push_status_sys("/help for commands  |  Tab completes names in /join and /msg");
 
-    // ── Restore saved windows ─────────────────────────────────────────────────
-    // New format: "ACTIVE=N" then "peer_id|name".
-    // Old format (just name) still works as fallback.
+    // --- WORKSPACE RESTORE ENGINE ---
     if let Ok(contents) = fs::read_to_string(".saved_windows.txt") {
-        let mut active_idx: Option<usize> = None;
-        let mut restored = 0usize;
-
+        let mut active_idx = None;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() { continue; }
-
             if let Some(idx_str) = line.strip_prefix("ACTIVE=") {
                 active_idx = idx_str.parse::<usize>().ok();
                 continue;
             }
-
-            let found_peer: Option<grammers_client::peer::Peer> =
-                if let Some((_id_str, name)) = line.split_once('|') {
-                    // Look up by display name (lowercased key in all_chats)
-                    app.all_chats.get(&name.to_lowercase()).cloned()
-                } else {
-                    // Old single-name format
-                    app.all_chats.get(&line.to_lowercase()).cloned()
-                };
-
-            if let Some(peer) = found_peer {
-                app.focus_window(peer);
-                restored += 1;
+            if let Some(peer) = app.all_chats.get(&line.to_lowercase()) {
+                app.focus_window(peer.clone());
             }
         }
-
-        if restored > 0 {
+        if !app.windows.is_empty() {
             let ai = active_idx.unwrap_or(0).min(app.windows.len() - 1);
             app.active = Some(ai);
             let _ = load_history(&client, &mut app, ai, 100).await;
-            app.push_status_sys(format!("Restored {} windows from last session.", restored));
+            app.push_status_sys(format!("Restored {} open windows from last session.", app.windows.len()));
         }
     }
 
-    // ── TUI ───────────────────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1042,7 +923,7 @@ async fn main() -> Result {
 
     let mut ev = EventStream::new();
     let mut updates_stream = client
-        .stream_updates(updates, UpdatesConfiguration { catch_up: false, ..Default::default() })
+        .stream_updates(updates, UpdatesConfiguration { catch_up: true, ..Default::default() })
         .await;
     let mut tick = interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1051,9 +932,7 @@ async fn main() -> Result {
 
     let res: Result = loop {
         tokio::select! {
-            _ = tick.tick() => {
-                terminal.draw(|f| ui(f, &app))?;
-            }
+            _ = tick.tick() => { terminal.draw(|f| ui(f, &app))?; }
 
             _ = refresh_tick.tick() => {
                 if let Some(ai) = app.active {
@@ -1063,65 +942,16 @@ async fn main() -> Result {
 
             maybe_ev = ev.next() => {
                 if let Some(Ok(CEvent::Key(key_ev))) = maybe_ev {
-                    if key_ev.kind != KeyEventKind::Press { continue; }
+                    
+                    if key_ev.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
                     match (key_ev.code, key_ev.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.save_windows();
                             break Ok(());
-                        }
-
-                        // Alt+1..9  → switch to window N
-                        (KeyCode::Char(ch), KeyModifiers::ALT) if ch.is_ascii_digit() => {
-                            let n = ch.to_digit(10).unwrap_or(0) as usize;
-                            if n == 1 {
-                                app.active = None;
-                                app.push_status_sys("Switched to status window.");
-                                app.save_windows();
-                            } else if n >= 2 {
-                                let idx = n - 2;
-                                if idx < app.windows.len() {
-                                    app.active = Some(idx);
-                                    app.windows[idx].unread = 0;
-                                    app.windows[idx].activity = WindowActivity::None;
-                                    let nm = app.windows[idx].name.clone();
-                                    app.push_sys(format!("-!- Now in: {}", nm));
-                                    let _ = load_history(&client, &mut app, idx, 100).await;
-                                    app.save_windows();
-                                }
-                            }
-                        }
-
-                        // Alt+Left / Alt+Right → cycle windows
-                        (KeyCode::Left, KeyModifiers::ALT) => {
-                            let new_active = match app.active {
-                                None if !app.windows.is_empty() => Some(app.windows.len() - 1),
-                                Some(0) => None,
-                                Some(i) => Some(i - 1),
-                                None => None,
-                            };
-                            app.active = new_active;
-                            if let Some(i) = app.active {
-                                app.windows[i].unread = 0;
-                                app.windows[i].activity = WindowActivity::None;
-                                let _ = load_history(&client, &mut app, i, 100).await;
-                            }
-                            app.save_windows();
-                        }
-                        (KeyCode::Right, KeyModifiers::ALT) => {
-                            let new_active = match app.active {
-                                None if !app.windows.is_empty() => Some(0),
-                                Some(i) if i + 1 < app.windows.len() => Some(i + 1),
-                                _ => None,
-                            };
-                            app.active = new_active;
-                            if let Some(i) = app.active {
-                                app.windows[i].unread = 0;
-                                app.windows[i].activity = WindowActivity::None;
-                                let _ = load_history(&client, &mut app, i, 100).await;
-                            }
-                            app.save_windows();
-                        }
-
+                        },
                         (KeyCode::Enter, _) => {
                             app.reset_tab();
                             let line = std::mem::take(&mut app.input);
@@ -1142,69 +972,91 @@ async fn main() -> Result {
                 }
             }
 
-            // ── Live updates ───────────────────────────────────────────────────
-            // CRITICAL FIX: updates_stream yields `Update` directly, not
-            // `Result<Update>`. The old `if let Ok(Update::NewMessage(...)) = upd`
-            // silently dropped every update because Ok() never matched a bare value.
-            maybe_upd = updates_stream.next() => {
-                let upd = match maybe_upd {
-                    Ok(u)  => u,
-                    Err(_) => continue,
-                };
-
-                if let Update::NewMessage(message) = upd {
-                    let from_peer = match message.peer() { Some(p) => p, None => continue };
-                    let chat_id   = from_peer.id();
-                    let ts        = message.date().with_timezone(&Local).format("%H:%M").to_string();
-                    let txt       = message.text().to_string();
-                    if txt.is_empty() { continue; }
+            // --- UPGRADED INCOMING MESSAGE ENGINE ---
+            upd = updates_stream.next() => {
+                if let Ok(Update::NewMessage(message)) = upd {
+                    
+                    // Safely extract the peer. 
+                    let from_peer = match message.peer() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    
+                    let chat_id = from_peer.id();
+                    let ts = message.date().with_timezone(&Local).format("%H:%M").to_string();
+                    let txt = message.text().to_string();
                     let highlight = message.mentioned();
+                    let is_pm = matches!(from_peer, grammers_client::peer::Peer::User(_));
+
+                    // --- Auto-Open Engine ---
+                    let mut is_open = app.windows.iter().any(|w| w.peer.id() == chat_id);
+                    
+                    // We ONLY auto-open if it's a direct message or someone specifically @mentioned you. 
+                    if !is_open && (is_pm || highlight) {
+                        app.add_peer(from_peer.clone());
+                        let new_idx = app.focus_window(from_peer.clone());
+                        let _ = load_history(&client, &mut app, new_idx, 20).await;
+                        app.save_windows();
+                        is_open = true;
+                        
+                        // If you didn't send the message yourself, trigger the highlight marker
+                        if !message.outgoing() {
+                            app.windows[new_idx].activity = WindowActivity::Highlight;
+                            app.windows[new_idx].unread += 1;
+                        }
+                    }
 
                     if message.outgoing() {
-                        // Find or create a window. Self-chat messages are always
-                        // outgoing, so we must create the window here too.
                         let win_idx = app.windows.iter().position(|w| w.peer.id() == chat_id);
-                        let i = if let Some(i) = win_idx {
-                            i
-                        } else {
-                            // New window (e.g. Saved Messages / self-chat)
-                            app.add_peer(from_peer.clone());
-                            let name = from_peer.name().unwrap_or("Saved Messages").to_string();
-                            app.windows.push(Window {
-                                peer: from_peer.clone(),
-                                name,
-                                unread: 0,
-                                activity: WindowActivity::None,
-                                lines: VecDeque::new(),
-                            });
-                            let new_idx = app.windows.len() - 1;
-                            // Load history so context is visible
-                            let _ = load_history(&client, &mut app, new_idx, 100).await;
-                            app.save_windows();
-                            new_idx
-                        };
-                        // Dedup: skip only if this exact text is already the last line
-                        // AND that line was added by us locally (not loaded from history).
-                        // Compare by text only — ts has minute precision and would swallow
-                        // fast consecutive messages.
-                        let already = app.windows[i].lines.back()
-                            .map(|l| l.prefix == "<You>" && l.text == txt && l.is_sys == false)
-                            .unwrap_or(false);
-                        if !already {
-                            app.windows[i].lines.push_back(ChatLine {
-                                ts, prefix: "<You>".to_string(), text: txt,
-                                is_sys: false, is_highlight: false, nick: Some("You".to_string()),
-                            });
-                            while app.windows[i].lines.len() > 2000 {
-                                app.windows[i].lines.pop_front();
+                        if let Some(i) = win_idx {
+                            if app.active != Some(i) && WindowActivity::Text > app.windows[i].activity {
+                                app.windows[i].activity = WindowActivity::Text;
+                            }
+
+                            let already = app.windows[i].lines.iter().rev().take(20)
+                                .any(|l| l.ts == ts && l.text == txt);
+                                
+                            if !already {
+                                let line = ChatLine {
+                                    ts: ts.clone(), prefix: "<You>".to_string(), text: txt.clone(),
+                                    is_sys: false, is_highlight: false, nick: Some("You".to_string()),
+                                };
+                                app.windows[i].lines.push_back(line);
+                                while app.windows[i].lines.len() > 2000 { app.windows[i].lines.pop_front(); }
                             }
                         }
                     } else {
-                        let sender = message.sender()
-                            .and_then(|s| s.name())
-                            .unwrap_or("Unknown")
-                            .to_string();
-                        app.push_incoming(&from_peer, ts, sender, txt, highlight);
+                        let sender = message.sender().and_then(|s| s.name()).unwrap_or("Unknown").to_string();
+                        let win_idx = app.windows.iter().position(|w| w.peer.id() == chat_id);
+                        
+                        if let Some(i) = win_idx {
+                            let is_active = app.active == Some(i);
+                            if !is_active {
+                                let lvl = if highlight || is_pm { WindowActivity::Highlight } else { WindowActivity::Text };
+                                if lvl > app.windows[i].activity { app.windows[i].activity = lvl; }
+                                app.windows[i].unread += 1;
+                            }
+                            
+                            let already = app.windows[i].lines.iter().rev().take(20)
+                                .any(|l| l.ts == ts && l.text == txt);
+                                
+                            if !already {
+                                let line = ChatLine {
+                                    ts: ts.clone(),
+                                    prefix: format!("<{}>", sender),
+                                    text: txt.clone(),
+                                    is_sys: false,
+                                    is_highlight: highlight,
+                                    nick: Some(sender.clone()),
+                                };
+                                app.windows[i].lines.push_back(line);
+                                while app.windows[i].lines.len() > 2000 { app.windows[i].lines.pop_front(); }
+                            }
+                        } else {
+                            // If it wasn't auto-opened (e.g. random group chatter), push a subtle status log instead of spamming tabs
+                            let peer_name = from_peer.name().unwrap_or("Unknown").to_string();
+                            app.push_status_sys(format!("New msg in {}: {}", peer_name, txt));
+                        }
                         app.save_windows();
                     }
                 }
