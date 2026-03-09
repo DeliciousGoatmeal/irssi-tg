@@ -456,29 +456,31 @@ impl App {
 // ── Media description ─────────────────────────────────────────────────────────
 // Returns a human-readable string for a media attachment.
 // Stickers show their emoji, photos/videos show a t.me deep-link style label.
-fn describe_media(media: &grammers_client::types::Media) -> String {
-    use grammers_client::types::Media;
+fn describe_media(media: &grammers_client::types::media::Media) -> String {
+    use grammers_client::types::media::Media;
     match media {
         Media::Sticker(s) => {
+            // grammers Sticker exposes .emoji() -> Option<&str>
             let emoji = s.emoji().unwrap_or("?");
             format!("[Sticker {}]", emoji)
         }
         Media::Photo(_) => "[Photo]".to_string(),
         Media::Document(d) => {
+            let mime = d.mime_type().unwrap_or("application/octet-stream");
             let name = d.name().unwrap_or("file");
-            let mime = d.mime_type().unwrap_or("?");
             if mime.starts_with("video/") {
                 format!("[Video: {}]", name)
             } else if mime.starts_with("audio/") {
                 format!("[Audio: {}]", name)
             } else if mime == "image/gif" || mime == "image/webp" {
-                format!("[GIF/Anim]")
+                "[GIF/Anim]".to_string()
             } else {
                 format!("[File: {}]", name)
             }
         }
-        Media::Contact(c) => format!("[Contact: {} {}]",
-            c.first_name(), c.last_name().unwrap_or("")),
+        Media::Contact(c) => {
+            format!("[Contact: {} {}]", c.first_name(), c.last_name().unwrap_or(""))
+        }
         Media::Geo(g) => format!("[Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
         Media::GeoLive(g) => format!("[Live Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
         Media::Poll(p) => format!("[Poll: {}]", p.question()),
@@ -510,7 +512,7 @@ async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usi
         };
         // Show sticker emoji / media type if no text caption
         let display_txt = if txt.is_empty() {
-            msg.media().map(|m| describe_media(&m)).unwrap_or_else(|| "[media]".to_string())
+            { let m = msg.media(); m.as_ref().map(describe_media).unwrap_or_else(|| "[media]".to_string()) }
         } else if msg.media().is_some() {
             // Has both text (caption) and media — prepend media label
             let label = describe_media(&msg.media().unwrap());
@@ -541,7 +543,7 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
                 None => continue, // truly empty, skip
             }
         } else if msg.media().is_some() {
-            format!("{} {}", describe_media(&msg.media().unwrap()), txt)
+            { let m = msg.media().unwrap(); format!("{} {}", describe_media(&m), txt) }
         } else {
             txt.clone()
         };
@@ -783,7 +785,7 @@ fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
     if !scroll_marker.is_empty() {
         spans.push(Span::styled(scroll_marker.to_string(), Style::default().fg(app.theme.highlight_bg)));
     }
-    spans.push(Span::styled(visible_input, Style::default().fg(app.theme.text_fg)));
+    spans.push(Span::styled(visible_input.clone(), Style::default().fg(app.theme.text_fg)));
     if let Some(h) = &tab_hint {
         // Only show tab hint if there's room
         let hint_space = (area.width as usize)
@@ -1329,7 +1331,7 @@ async fn main() -> Result {
                             None    => continue, // truly empty update, skip
                         }
                     } else if message.media().is_some() {
-                        format!("{} {}", describe_media(&message.media().unwrap()), raw_txt)
+                        { let m = message.media().unwrap(); format!("{} {}", describe_media(&m), raw_txt) }
                     } else {
                         raw_txt
                     };
