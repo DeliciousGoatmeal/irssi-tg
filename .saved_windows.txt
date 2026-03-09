@@ -1,4 +1,5 @@
-ACTIVE=1
+ACTIVE=0
 -1002913367769|Pupifer's Bad Dog (21+ & NSFW)
 726129703|Mikaroni (Enticer of tastebuds) ΘΔ
 -1003399583177|Halcyon Underground Community
+8122362766|🦊+ 🐈= 📠
