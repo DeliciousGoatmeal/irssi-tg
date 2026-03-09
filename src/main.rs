@@ -176,6 +176,8 @@ struct Window {
     unread: usize,
     activity: WindowActivity,
     lines: VecDeque<ChatLine>,
+    /// Known nicks in this channel (for @ completion)
+    nicks: Vec<String>,
 }
 
 struct TabState {
@@ -271,7 +273,8 @@ impl App {
         }
         let name = peer.name().unwrap_or("Unknown").to_string();
         self.windows.push(Window {
-            peer, name, unread: 0, activity: WindowActivity::None, lines: VecDeque::new(),
+            peer, name, unread: 0, activity: WindowActivity::None,
+            lines: VecDeque::new(), nicks: Vec::new(),
         });
         self.windows.len() - 1
     }
@@ -286,6 +289,12 @@ impl App {
         highlight: bool,
     ) {
         let chat_id = from_peer.id();
+        // Track nick for @ completion
+        if let Some(i) = self.windows.iter().position(|w| w.peer.id() == chat_id) {
+            if !self.windows[i].nicks.contains(&nick) {
+                self.windows[i].nicks.push(nick.clone());
+            }
+        }
         let line = ChatLine {
             ts,
             prefix: format!("<{}>", nick),
@@ -317,6 +326,7 @@ impl App {
                 unread: 0,
                 activity: WindowActivity::None,
                 lines: VecDeque::new(),
+                nicks: Vec::new(),
             });
             self.windows.len() - 1
         };
@@ -334,6 +344,57 @@ impl App {
     // ── Tab completion ────────────────────────────────────────────────────────
     fn do_tab(&mut self) {
         let raw = self.input.clone();
+
+        // ── @ mention completion (mid-message) ────────────────────────────────
+        // Triggered when the last word starts with @
+        if let Some(at_pos) = raw.rfind('@') {
+            let partial = &raw[at_pos + 1..];
+            let partial_lc = partial.to_lowercase();
+            let before = raw[..at_pos].to_string();
+
+            // Collect nicks from current window, fall back to all_chats
+            let candidates: Vec<String> = if let Some(ai) = self.active {
+                let win_nicks = self.windows[ai].nicks.clone();
+                if !win_nicks.is_empty() {
+                    win_nicks.into_iter()
+                        .filter(|n| n.to_lowercase().starts_with(&partial_lc))
+                        .collect()
+                } else {
+                    self.ordered_chats.iter()
+                        .filter(|(lc, _)| lc.starts_with(&partial_lc))
+                        .map(|(_, p)| p.name().unwrap_or("Unknown").to_string())
+                        .collect()
+                }
+            } else {
+                return;
+            };
+
+            let reuse = self.tab.as_ref()
+                .map(|t| t.cmd_prefix == before && t.word_start == partial.to_string())
+                .unwrap_or(false);
+
+            if !reuse {
+                let mut cands = candidates;
+                cands.sort_by_key(|s| s.to_lowercase());
+                cands.dedup();
+                if cands.is_empty() { return; }
+                self.tab = Some(TabState {
+                    candidates: cands,
+                    idx: 0,
+                    cmd_prefix: before.clone(),
+                    word_start: partial.to_string(),
+                });
+            } else if let Some(ref mut t) = self.tab {
+                t.idx = (t.idx + 1) % t.candidates.len();
+            }
+
+            if let Some(ref t) = self.tab {
+                self.input = format!("{}@{}", t.cmd_prefix, t.candidates[t.idx]);
+            }
+            return;
+        }
+
+        // ── Command argument completion ────────────────────────────────────────
         let (cmd_prefix, partial) = if let Some(r) = raw.strip_prefix("/join ") {
             ("/join ".to_string(), r.to_string())
         } else if let Some(r) = raw.strip_prefix("/msg ") {
@@ -407,10 +468,20 @@ async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usi
         let (prefix, nick) = if msg.outgoing() {
             ("<You>".to_string(), Some("You".to_string()))
         } else {
+            // Collect sender names for @ completion
+            if !app.windows[win_idx].nicks.contains(&sender) {
+                app.windows[win_idx].nicks.push(sender.clone());
+            }
             (format!("<{}>", sender), Some(sender))
         };
+        // Show sticker emoji if message has no text but has media
+        let display_txt = if txt.is_empty() {
+            "[media]".to_string()
+        } else {
+            txt
+        };
         app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: txt, is_sys: false, is_highlight: false, nick,
+            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick,
         });
     }
     Ok(())
@@ -748,25 +819,49 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
     // /names [chat]
     if let Some(rest) = text.strip_prefix("/names") {
         let target = rest.trim();
-        let peer = if target.is_empty() {
-            app.active.map(|ai| app.windows[ai].peer.clone())
+        let (peer, win_idx) = if target.is_empty() {
+            let wi = app.active;
+            (wi.map(|ai| app.windows[ai].peer.clone()), wi)
         } else {
-            app.find_best_match_key(target).and_then(|k| app.all_chats.get(&k).cloned())
+            let p = app.find_best_match_key(target).and_then(|k| app.all_chats.get(&k).cloned());
+            let wi = p.as_ref().and_then(|pp| app.windows.iter().position(|w| w.peer.id() == pp.id()));
+            (p, wi)
         };
         if let Some(p) = peer {
             let label = p.name().unwrap_or("Unknown").to_string();
             app.push_sys(format!("-!- Fetching names for {}...", label));
             if let Some(p_ref) = p.to_ref().await {
                 let mut participants = client.iter_participants(p_ref);
-                let mut names = Vec::new();
+                let mut names: Vec<String> = Vec::new();
                 while let Ok(Some(part)) = participants.next().await {
                     let name_str = part.user.first_name()
                         .unwrap_or_else(|| part.user.username().unwrap_or("Unknown"))
                         .to_string();
                     names.push(name_str);
-                    if names.len() >= 100 { names.push("...".to_string()); break; }
+                    if names.len() >= 200 { break; }
                 }
-                app.push_sys(format!("-!- Names: {}", names.join(", ")));
+                names.sort_by_key(|s| s.to_lowercase());
+
+                // Store nicks for @ completion
+                if let Some(wi) = win_idx {
+                    app.windows[wi].nicks = names.clone();
+                }
+
+                // Render as irssi-style columns: fixed width, sorted alphabetically
+                let col_w = names.iter().map(|n| n.len()).max().unwrap_or(10) + 2;
+                let col_w = col_w.max(12).min(28);
+                // Use 80 chars as a safe terminal width estimate for the column grid
+                let term_w = 78usize;
+                let cols = (term_w / col_w).max(1);
+                app.push_sys(format!("-!- {} ({} users):", label, names.len()));
+                for chunk in names.chunks(cols) {
+                    let row: String = chunk.iter()
+                        .map(|n| format!("{:<width$}", n, width = col_w))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    app.push_sys(format!("    {}", row.trim_end()));
+                }
+                app.push_sys(format!("-!- Total: {} users  (Tab after @ to mention)", names.len()));
             }
         } else {
             app.push_sys("-!- Cannot find chat for /names");
@@ -1176,6 +1271,7 @@ async fn main() -> Result {
                                 unread: 0,
                                 activity: WindowActivity::None,
                                 lines: VecDeque::new(),
+                                nicks: Vec::new(),
                             });
                             let new_idx = app.windows.len() - 1;
                             // Load history so context is visible
