@@ -453,6 +453,40 @@ impl App {
 
 // ── History ───────────────────────────────────────────────────────────────────
 
+// ── Media description ─────────────────────────────────────────────────────────
+// Returns a human-readable string for a media attachment.
+// Stickers show their emoji, photos/videos show a t.me deep-link style label.
+fn describe_media(media: &grammers_client::types::Media) -> String {
+    use grammers_client::types::Media;
+    match media {
+        Media::Sticker(s) => {
+            let emoji = s.emoji().unwrap_or("?");
+            format!("[Sticker {}]", emoji)
+        }
+        Media::Photo(_) => "[Photo]".to_string(),
+        Media::Document(d) => {
+            let name = d.name().unwrap_or("file");
+            let mime = d.mime_type().unwrap_or("?");
+            if mime.starts_with("video/") {
+                format!("[Video: {}]", name)
+            } else if mime.starts_with("audio/") {
+                format!("[Audio: {}]", name)
+            } else if mime == "image/gif" || mime == "image/webp" {
+                format!("[GIF/Anim]")
+            } else {
+                format!("[File: {}]", name)
+            }
+        }
+        Media::Contact(c) => format!("[Contact: {} {}]",
+            c.first_name(), c.last_name().unwrap_or("")),
+        Media::Geo(g) => format!("[Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
+        Media::GeoLive(g) => format!("[Live Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
+        Media::Poll(p) => format!("[Poll: {}]", p.question()),
+        Media::Venue(v) => format!("[Venue: {}]", v.title()),
+        _ => "[Media]".to_string(),
+    }
+}
+
 async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usize) -> Result {
     let peer = app.windows[win_idx].peer.clone();
     let peer_ref = match peer.to_ref().await { Some(r) => r, None => return Ok(()) };
@@ -474,9 +508,13 @@ async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usi
             }
             (format!("<{}>", sender), Some(sender))
         };
-        // Show sticker emoji if message has no text but has media
+        // Show sticker emoji / media type if no text caption
         let display_txt = if txt.is_empty() {
-            "[media]".to_string()
+            msg.media().map(|m| describe_media(&m)).unwrap_or_else(|| "[media]".to_string())
+        } else if msg.media().is_some() {
+            // Has both text (caption) and media — prepend media label
+            let label = describe_media(&msg.media().unwrap());
+            format!("{} {}", label, txt)
         } else {
             txt
         };
@@ -497,9 +535,18 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
     for msg in buf {
         let ts = msg.date().with_timezone(&Local).format("%H:%M").to_string();
         let txt = msg.text().to_string();
-        if txt.is_empty() { continue; }
+        let display_txt = if txt.is_empty() {
+            match msg.media() {
+                Some(m) => describe_media(&m),
+                None => continue, // truly empty, skip
+            }
+        } else if msg.media().is_some() {
+            format!("{} {}", describe_media(&msg.media().unwrap()), txt)
+        } else {
+            txt.clone()
+        };
         let already = app.windows[win_idx].lines.iter().rev().take(30)
-            .any(|l| l.ts == ts && l.text == txt);
+            .any(|l| l.ts == ts && l.text == display_txt);
         if already { continue; }
         let sender = msg.sender().and_then(|s| s.name()).unwrap_or("Unknown").to_string();
         let (prefix, nick) = if msg.outgoing() {
@@ -508,7 +555,7 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
             (format!("<{}>", sender), Some(sender))
         };
         app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: txt, is_sys: false, is_highlight: false, nick,
+            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick,
         });
         while app.windows[win_idx].lines.len() > 2000 { app.windows[win_idx].lines.pop_front(); }
     }
@@ -707,10 +754,24 @@ fn draw_window_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
     let chan_prefix = format!("[{}] ", app.active_name());
+    let prefix_w = UnicodeWidthStr::width(chan_prefix.as_str()) as usize;
+    let avail_w  = (area.width as usize).saturating_sub(prefix_w);
+
+    // Scroll input so the cursor (end of input) is always visible.
+    // We show a window of `avail_w` chars ending at the cursor.
+    let input_chars: Vec<char> = app.input.chars().collect();
+    let cursor_pos = input_chars.len(); // cursor always at end for now
+    let view_end   = cursor_pos;
+    let view_start = if view_end >= avail_w { view_end - avail_w } else { 0 };
+    let visible_input: String = input_chars[view_start..view_end].iter().collect();
+
+    // Scrolled indicator: show "‹" if we've scrolled right
+    let scroll_marker = if view_start > 0 { "‹" } else { "" };
+
     let tab_hint = app.tab.as_ref().and_then(|t| {
         if t.candidates.len() > 1 {
             let others: Vec<&str> = t.candidates.iter().enumerate()
-                .filter(|(i, _)| *i != t.idx).take(5)
+                .filter(|(i, _)| *i != t.idx).take(3)
                 .map(|(_, s)| s.as_str()).collect();
             Some(format!("  [{}]", others.join(" | ")))
         } else { None }
@@ -718,16 +779,26 @@ fn draw_input_line(f: &mut Frame, app: &App, area: Rect) {
 
     let mut spans = vec![
         Span::styled(chan_prefix, Style::default().fg(app.theme.bar_fg).add_modifier(Modifier::BOLD)),
-        Span::styled(app.input.clone(), Style::default().fg(app.theme.text_fg)),
     ];
+    if !scroll_marker.is_empty() {
+        spans.push(Span::styled(scroll_marker.to_string(), Style::default().fg(app.theme.highlight_bg)));
+    }
+    spans.push(Span::styled(visible_input, Style::default().fg(app.theme.text_fg)));
     if let Some(h) = &tab_hint {
-        spans.push(Span::styled(h.clone(), Style::default().fg(app.theme.timestamp)));
+        // Only show tab hint if there's room
+        let hint_space = (area.width as usize)
+            .saturating_sub(prefix_w + UnicodeWidthStr::width(app.input.as_str()) + 1);
+        if hint_space > 5 {
+            spans.push(Span::styled(h.clone(), Style::default().fg(app.theme.timestamp)));
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
-    let prefix_w = UnicodeWidthStr::width(format!("[{}] ", app.active_name()).as_str()) as u16;
-    let input_w  = UnicodeWidthStr::width(app.input.as_str()) as u16;
-    let cx = (area.x + prefix_w + input_w).min(area.x + area.width.saturating_sub(1));
+    // Cursor sits at end of visible input
+    let visible_w = UnicodeWidthStr::width(visible_input.as_str()) as u16;
+    let scroll_w  = if view_start > 0 { 1u16 } else { 0 };
+    let cx = (area.x + prefix_w as u16 + scroll_w + visible_w)
+        .min(area.x + area.width.saturating_sub(1));
     f.set_cursor(cx, area.y);
 }
 
@@ -1251,8 +1322,17 @@ async fn main() -> Result {
                     let from_peer = match message.peer() { Some(p) => p, None => continue };
                     let chat_id   = from_peer.id();
                     let ts        = message.date().with_timezone(&Local).format("%H:%M").to_string();
-                    let txt       = message.text().to_string();
-                    if txt.is_empty() { continue; }
+                    let raw_txt   = message.text().to_string();
+                    let txt = if raw_txt.is_empty() {
+                        match message.media() {
+                            Some(m) => describe_media(&m),
+                            None    => continue, // truly empty update, skip
+                        }
+                    } else if message.media().is_some() {
+                        format!("{} {}", describe_media(&message.media().unwrap()), raw_txt)
+                    } else {
+                        raw_txt
+                    };
                     let highlight = message.mentioned();
 
                     if message.outgoing() {
