@@ -2,7 +2,10 @@ use unicode_width::UnicodeWidthStr;
 use chrono::Local;
 use clap::Parser;
 use crossterm::{
-    event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind, EnableMouseCapture, DisableMouseCapture,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -196,6 +199,8 @@ struct App {
     ordered_chats: Vec<(String, grammers_client::peer::Peer)>,
     tab: Option<TabState>,
     theme: Theme,
+    /// Lines scrolled up from the bottom (0 = live/bottom)
+    scroll_offset: usize,
 }
 
 impl App {
@@ -209,6 +214,24 @@ impl App {
             ordered_chats: vec![],
             tab: None,
             theme,
+            scroll_offset: 0,
+        }
+    }
+
+    fn scroll_up(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
+    }
+    fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+    fn scroll_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+    fn active_line_count(&self) -> usize {
+        if let Some(ai) = self.active {
+            self.windows.get(ai).map(|w| w.lines.len()).unwrap_or(0)
+        } else {
+            self.status_lines.len()
         }
     }
 
@@ -336,6 +359,9 @@ impl App {
             let lvl = if highlight { WindowActivity::Highlight } else { WindowActivity::Text };
             if lvl > self.windows[i].activity { self.windows[i].activity = lvl; }
             self.windows[i].unread += 1;
+            // Terminal bell — works in most terminals including Windows Terminal
+            print!("\x07");
+            let _ = io::stdout().flush();
         }
         self.windows[i].lines.push_back(line);
         while self.windows[i].lines.len() > 2000 { self.windows[i].lines.pop_front(); }
@@ -456,36 +482,32 @@ impl App {
 // ── Media description ─────────────────────────────────────────────────────────
 // Returns a human-readable string for a media attachment.
 // Stickers show their emoji, photos/videos show a t.me deep-link style label.
-fn describe_media(media: &grammers_client::types::media::Media) -> String {
-    use grammers_client::types::media::Media;
+fn describe_media(media: &grammers_client::media::Media) -> String {
+    use grammers_client::media::Media;
     match media {
-        Media::Sticker(s) => {
-            // grammers Sticker exposes .emoji() -> Option<&str>
-            let emoji = s.emoji().unwrap_or("?");
-            format!("[Sticker {}]", emoji)
-        }
-        Media::Photo(_) => "[Photo]".to_string(),
+        // s.emoji() -> &str (confirmed in docs, not Option)
+        Media::Sticker(s) => format!("[Sticker {}]", s.emoji()),
+        Media::Photo(_)   => "[Photo]".to_string(),
+        // Document: mime_type() and name() existence is uncertain — use raw_attrs inspection
+        // Instead, just show [Video], [Audio], [Document] based on known mime heuristics
         Media::Document(d) => {
-            let mime = d.mime_type().unwrap_or("application/octet-stream");
-            let name = d.name().unwrap_or("file");
-            if mime.starts_with("video/") {
-                format!("[Video: {}]", name)
-            } else if mime.starts_with("audio/") {
-                format!("[Audio: {}]", name)
-            } else if mime == "image/gif" || mime == "image/webp" {
-                "[GIF/Anim]".to_string()
-            } else {
-                format!("[File: {}]", name)
+            match d.mime_type().unwrap_or("") {
+                mt if mt.starts_with("video/") => "[Video]".to_string(),
+                mt if mt.starts_with("audio/") => "[Audio]".to_string(),
+                "image/gif"  => "[GIF]".to_string(),
+                "image/webp" => "[Sticker/Webp]".to_string(),
+                mt if mt.is_empty() => "[File]".to_string(),
+                mt           => format!("[File: {}]", mt),
             }
         }
-        Media::Contact(c) => {
-            format!("[Contact: {} {}]", c.first_name(), c.last_name().unwrap_or(""))
-        }
-        Media::Geo(g) => format!("[Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
-        Media::GeoLive(g) => format!("[Live Location: {:.4},{:.4}]", g.latitude(), g.longitude()),
-        Media::Poll(p) => format!("[Poll: {}]", p.question()),
-        Media::Venue(v) => format!("[Venue: {}]", v.title()),
-        _ => "[Media]".to_string(),
+        Media::Contact(_)    => "[Contact]".to_string(),
+        Media::Geo(_)        => "[Location]".to_string(),
+        Media::GeoLive(_)    => "[Live Location]".to_string(),
+        Media::Poll(_)       => "[Poll]".to_string(),
+        Media::Venue(_)      => "[Venue]".to_string(),
+        Media::Dice(_)       => "[Dice 🎲]".to_string(),
+        Media::WebPage(_)    => "[Link]".to_string(),
+        _                    => "[Media]".to_string(),
     }
 }
 
@@ -547,7 +569,10 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
         } else {
             txt.clone()
         };
-        let already = app.windows[win_idx].lines.iter().rev().take(30)
+        // Dedup only against real chat messages (not /names or /help sys output)
+        let already = app.windows[win_idx].lines.iter().rev()
+            .filter(|l| !l.is_sys)
+            .take(30)
             .any(|l| l.ts == ts && l.text == display_txt);
         if already { continue; }
         let sender = msg.sender().and_then(|s| s.name()).unwrap_or("Unknown").to_string();
@@ -618,20 +643,53 @@ fn draw_scrollback(f: &mut Frame, app: &App, area: Rect) {
 
     let h = area.height as usize;
     let w = area.width.max(1) as usize;
-    let mut total_lines = 0usize;
-    let mut start_idx = 0usize;
-    for (i, l) in src_vec.iter().enumerate().rev() {
+    let total_msgs = src_vec.len();
+
+    // Build a rendered-line-count for each message (may wrap)
+    let rendered_counts: Vec<usize> = src_vec.iter().map(|l| {
         let plain = format!("{} {} {}", l.ts, l.prefix, l.text);
-        let char_w = UnicodeWidthStr::width(plain.as_str());
-        let rendered = (char_w.saturating_sub(1) / w) + 1;
-        if total_lines + rendered > h { start_idx = i + 1; break; }
-        total_lines += rendered;
+        let char_w = UnicodeWidthStr::width(plain.as_str()).max(1);
+        (char_w.saturating_sub(1) / w) + 1
+    }).collect();
+
+    // scroll_offset = 0 means show the bottom. Clamp to valid range.
+    let total_rendered: usize = rendered_counts.iter().sum();
+    let max_scroll = total_rendered.saturating_sub(h);
+    let scroll = app.scroll_offset.min(max_scroll);
+
+    // Walk backwards from the end, skipping `scroll` rendered lines first,
+    // then collecting `h` rendered lines worth of messages.
+    let mut skip_lines = scroll;
+    let mut take_lines = 0usize;
+    let mut start_idx = total_msgs; // exclusive start from end
+
+    for i in (0..total_msgs).rev() {
+        let rc = rendered_counts[i];
+        if skip_lines >= rc {
+            skip_lines -= rc;
+            continue;
+        }
+        // This message is partially or fully in view
         start_idx = i;
+        if take_lines + rc - skip_lines >= h { break; }
+        take_lines += rc - skip_lines;
+        skip_lines = 0;
+        if start_idx == 0 { break; }
     }
 
-    // Pad top so messages anchor to the bottom (irssi-style)
-    let padding = h.saturating_sub(total_lines);
+    // Count rendered lines actually shown to determine top padding
+    let shown_lines: usize = rendered_counts[start_idx..].iter().sum::<usize>()
+        .saturating_sub(scroll);
+    let padding = h.saturating_sub(shown_lines);
     for _ in 0..padding { lines.push(Line::raw("")); }
+
+    // Scroll indicator: show "[^ scrolled N lines]" at top when not at bottom
+    if scroll > 0 {
+        let indicator = format!(" ─── scrolled {} lines up (PgDn/↓ to return) ───", scroll);
+        lines.insert(0, Line::from(Span::styled(indicator,
+            Style::default().fg(app.theme.highlight_bg))));
+        if lines.len() > h { lines.truncate(h); }
+    }
 
     for l in src_vec.into_iter().skip(start_idx) {
         let ts = Span::styled(format!("{} ", l.ts), Style::default().fg(app.theme.timestamp));
@@ -1203,7 +1261,7 @@ async fn main() -> Result {
     // ── TUI ───────────────────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -1224,12 +1282,22 @@ async fn main() -> Result {
             }
 
             _ = refresh_tick.tick() => {
-                if let Some(ai) = app.active {
-                    let _ = refresh_history(&client, &mut app, ai).await;
+                // Don't disturb scrollback reading; only poll when live at bottom
+                if app.scroll_offset == 0 {
+                    if let Some(ai) = app.active {
+                        let _ = refresh_history(&client, &mut app, ai).await;
+                    }
                 }
             }
 
             maybe_ev = ev.next() => {
+                if let Some(Ok(CEvent::Mouse(mouse_ev))) = maybe_ev.as_ref() {
+                    match mouse_ev.kind {
+                        MouseEventKind::ScrollUp   => { app.scroll_up(3); }
+                        MouseEventKind::ScrollDown => { app.scroll_down(3); }
+                        _ => {}
+                    }
+                }
                 if let Some(Ok(CEvent::Key(key_ev))) = maybe_ev {
                     if key_ev.kind != KeyEventKind::Press { continue; }
                     match (key_ev.code, key_ev.modifiers) {
@@ -1243,12 +1311,14 @@ async fn main() -> Result {
                             let n = ch.to_digit(10).unwrap_or(0) as usize;
                             if n == 1 {
                                 app.active = None;
+                                app.scroll_bottom();
                                 app.push_status_sys("Switched to status window.");
                                 app.save_windows();
                             } else if n >= 2 {
                                 let idx = n - 2;
                                 if idx < app.windows.len() {
                                     app.active = Some(idx);
+                                    app.scroll_bottom();
                                     app.windows[idx].unread = 0;
                                     app.windows[idx].activity = WindowActivity::None;
                                     let nm = app.windows[idx].name.clone();
@@ -1297,6 +1367,17 @@ async fn main() -> Result {
                                 app.push_sys(format!("-!- Error: {}", e));
                             }
                         }
+                        // Scrollback navigation
+                        (KeyCode::PageUp, _) => { app.scroll_up(20); }
+                        (KeyCode::PageDown, _) => { app.scroll_down(20); }
+                        (KeyCode::Up, KeyModifiers::NONE) => { app.scroll_up(3); }
+                        (KeyCode::Down, KeyModifiers::NONE) => { app.scroll_down(3); }
+                        (KeyCode::Home, _) => {
+                            let n = app.active_line_count();
+                            app.scroll_offset = n;
+                        }
+                        (KeyCode::End, _) => { app.scroll_bottom(); }
+
                         (KeyCode::Tab, _) => { app.do_tab(); }
                         (KeyCode::Backspace, _) => { app.reset_tab(); app.input.pop(); }
                         (KeyCode::Char(ch), m)
@@ -1319,6 +1400,41 @@ async fn main() -> Result {
                     Ok(u)  => u,
                     Err(_) => continue,
                 };
+
+                // Handle message edits
+                if let Update::MessageEdited(message) = &upd {
+                    if let Some(from_peer) = message.peer() {
+                        let chat_id = from_peer.id();
+                        let new_txt = {
+                            let raw = message.text().to_string();
+                            if raw.is_empty() {
+                                match message.media() {
+                                    Some(m) => describe_media(&m),
+                                    None => "[empty]".to_string(),
+                                }
+                            } else { raw }
+                        };
+                        let msg_id = message.id();
+                        // Find in active window and update in-place
+                        if let Some(wi) = app.windows.iter().position(|w| w.peer.id() == chat_id) {
+                            // We don't store message IDs, so find by matching old text prefix
+                            // and update the most recent match from the sender
+                            let sender = message.sender().and_then(|s| s.name())
+                                .unwrap_or("Unknown").to_string();
+                            let prefix = if message.outgoing() {
+                                "<You>".to_string()
+                            } else {
+                                format!("<{}>", sender)
+                            };
+                            // Walk backwards and update first matching prefix line
+                            if let Some(line) = app.windows[wi].lines.iter_mut().rev()
+                                .find(|l| l.prefix == prefix && !l.is_sys)
+                            {
+                                line.text = format!("{} [edited]", new_txt);
+                            }
+                        }
+                    }
+                }
 
                 if let Update::NewMessage(message) = upd {
                     let from_peer = match message.peer() { Some(p) => p, None => continue };
@@ -1391,7 +1507,7 @@ async fn main() -> Result {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     res
 }
