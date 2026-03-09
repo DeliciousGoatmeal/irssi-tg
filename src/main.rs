@@ -22,7 +22,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs,
     io::{self, Write},
@@ -167,6 +167,8 @@ struct ChatLine {
     is_sys: bool,
     is_highlight: bool,
     nick: Option<String>,
+    /// Non-zero if this line has downloadable media; use /download <id>
+    media_id: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,6 +183,10 @@ struct Window {
     lines: VecDeque<ChatLine>,
     /// Known nicks in this channel (for @ completion)
     nicks: Vec<String>,
+    /// Counter for assigning media IDs in this window
+    next_media_id: u32,
+    /// Message IDs we've already displayed (for refresh dedup)
+    seen_msg_ids: HashSet<i32>,
 }
 
 struct TabState {
@@ -201,6 +207,8 @@ struct App {
     theme: Theme,
     /// Lines scrolled up from the bottom (0 = live/bottom)
     scroll_offset: usize,
+    /// Texts we just sent so the update-stream echo can be suppressed.
+    pending_sends: HashSet<String>,
 }
 
 impl App {
@@ -215,6 +223,7 @@ impl App {
             tab: None,
             theme,
             scroll_offset: 0,
+            pending_sends: HashSet::new(),
         }
     }
 
@@ -249,8 +258,8 @@ impl App {
             text: text.into(),
             is_sys: true,
             is_highlight: false,
-            nick: None,
-        }
+            nick: None, media_id: 0,
+                   }
     }
 
     fn push_status_sys(&mut self, text: impl Into<String>) {
@@ -297,7 +306,7 @@ impl App {
         let name = peer.name().unwrap_or("Unknown").to_string();
         self.windows.push(Window {
             peer, name, unread: 0, activity: WindowActivity::None,
-            lines: VecDeque::new(), nicks: Vec::new(),
+            lines: VecDeque::new(), nicks: Vec::new(), next_media_id: 1, seen_msg_ids: HashSet::new(),
         });
         self.windows.len() - 1
     }
@@ -306,6 +315,7 @@ impl App {
     fn push_incoming(
         &mut self,
         from_peer: &grammers_client::peer::Peer,
+        msg_id: i32,
         ts: String,
         nick: String,
         text: String,
@@ -318,13 +328,14 @@ impl App {
                 self.windows[i].nicks.push(nick.clone());
             }
         }
-        let line = ChatLine {
+        let mut line = ChatLine {
             ts,
             prefix: format!("<{}>", nick),
             text,
             is_sys: false,
             is_highlight: highlight,
             nick: Some(nick.clone()),
+            media_id: 0,
         };
 
         // Find existing window by peer ID, or fuzzy name match
@@ -350,6 +361,8 @@ impl App {
                 activity: WindowActivity::None,
                 lines: VecDeque::new(),
                 nicks: Vec::new(),
+                next_media_id: 1,
+                seen_msg_ids: HashSet::new(),
             });
             self.windows.len() - 1
         };
@@ -363,6 +376,16 @@ impl App {
             print!("\x07");
             let _ = io::stdout().flush();
         }
+        // Dedup by message ID — skip if already shown (e.g. loaded by refresh_history)
+        if msg_id != 0 && self.windows[i].seen_msg_ids.contains(&msg_id) { return; }
+        let media_id = if line.text.contains("#0]") {
+            let id = self.windows[i].next_media_id;
+            self.windows[i].next_media_id += 1;
+            line.text = line.text.replace("#0]", &format!("#{}]", id));
+            id
+        } else { 0 };
+        line.media_id = media_id;
+        if msg_id != 0 { self.windows[i].seen_msg_ids.insert(msg_id); }
         self.windows[i].lines.push_back(line);
         while self.windows[i].lines.len() > 2000 { self.windows[i].lines.pop_front(); }
     }
@@ -482,22 +505,23 @@ impl App {
 // ── Media description ─────────────────────────────────────────────────────────
 // Returns a human-readable string for a media attachment.
 // Stickers show their emoji, photos/videos show a t.me deep-link style label.
-fn describe_media(media: &grammers_client::media::Media) -> String {
+fn describe_media(media: &grammers_client::media::Media, id: u32) -> String {
+    let id_tag = if id > 0 { format!(" #{}", id) } else { String::new() };
     use grammers_client::media::Media;
     match media {
         // s.emoji() -> &str (confirmed in docs, not Option)
         Media::Sticker(s) => format!("[Sticker {}]", s.emoji()),
-        Media::Photo(_)   => "[Photo]".to_string(),
+        Media::Photo(_)   => format!("[Photo{}]", id_tag),
         // Document: mime_type() and name() existence is uncertain — use raw_attrs inspection
         // Instead, just show [Video], [Audio], [Document] based on known mime heuristics
         Media::Document(d) => {
             match d.mime_type().unwrap_or("") {
-                mt if mt.starts_with("video/") => "[Video]".to_string(),
-                mt if mt.starts_with("audio/") => "[Audio]".to_string(),
-                "image/gif"  => "[GIF]".to_string(),
-                "image/webp" => "[Sticker/Webp]".to_string(),
-                mt if mt.is_empty() => "[File]".to_string(),
-                mt           => format!("[File: {}]", mt),
+                mt if mt.starts_with("video/") => format!("[Video{}]", id_tag),
+                mt if mt.starts_with("audio/") => format!("[Audio{}]", id_tag),
+                "image/gif"  => format!("[GIF{}]", id_tag),
+                "image/webp" => format!("[Sticker/Webp{}]", id_tag),
+                mt if mt.is_empty() => format!("[File{}]", id_tag),
+                mt           => format!("[File: {}{}]", mt, id_tag),
             }
         }
         Media::Contact(_)    => "[Contact]".to_string(),
@@ -505,12 +529,29 @@ fn describe_media(media: &grammers_client::media::Media) -> String {
         Media::GeoLive(_)    => "[Live Location]".to_string(),
         Media::Poll(_)       => "[Poll]".to_string(),
         Media::Venue(_)      => "[Venue]".to_string(),
-        Media::Dice(_)       => "[Dice 🎲]".to_string(),
+        Media::Dice(_)       => "[Dice 🎲]".to_string(),  // no id needed
         Media::WebPage(_)    => "[Link]".to_string(),
         _                    => "[Media]".to_string(),
     }
 }
 
+/// Returns the original sender name if this message was forwarded.
+/// Parses msg.raw Debug string — no type imports needed.
+fn forward_origin_raw(msg_raw_debug: &str) -> Option<String> {
+    if !msg_raw_debug.contains("fwd_from: Some(") {
+        return None;
+    }
+    if let Some(i) = msg_raw_debug.find("from_name: Some(\"") {
+        let rest = &msg_raw_debug[i + 17..];
+        if let Some(j) = rest.find('"') {
+            let name = &rest[..j];
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    Some("forwarded".to_string())
+}
 async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usize) -> Result {
     let peer = app.windows[win_idx].peer.clone();
     let peer_ref = match peer.to_ref().await { Some(r) => r, None => return Ok(()) };
@@ -532,19 +573,27 @@ async fn load_history(client: &Client, app: &mut App, win_idx: usize, limit: usi
             }
             (format!("<{}>", sender), Some(sender))
         };
-        // Show sticker emoji / media type if no text caption
+        let fwd_prefix = forward_origin_raw(&format!("{:?}", msg.raw))
+            .map(|n| format!("[Fwd: {}] ", n))
+            .unwrap_or_default();
+        let mid = if msg.media().is_some() {
+            let id = app.windows[win_idx].next_media_id;
+            app.windows[win_idx].next_media_id += 1;
+            id
+        } else { 0 };
         let display_txt = if txt.is_empty() {
-            { let m = msg.media(); m.as_ref().map(describe_media).unwrap_or_else(|| "[media]".to_string()) }
+            let media_str = msg.media().as_ref().map(|m| describe_media(m, mid)).unwrap_or_else(|| "[media]".to_string());
+            format!("{}{}", fwd_prefix, media_str)
         } else if msg.media().is_some() {
-            // Has both text (caption) and media — prepend media label
-            let label = describe_media(&msg.media().unwrap());
-            format!("{} {}", label, txt)
+            let label = describe_media(&msg.media().unwrap(), mid);
+            format!("{}{} {}", fwd_prefix, label, txt)
         } else {
-            txt
+            format!("{}{}", fwd_prefix, txt)
         };
+        app.windows[win_idx].seen_msg_ids.insert(msg.id());
         app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick,
-        });
+            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick, media_id: mid
+            });
     }
     Ok(())
 }
@@ -557,32 +606,38 @@ async fn refresh_history(client: &Client, app: &mut App, win_idx: usize) -> Resu
     while let Some(msg) = it.next().await? { buf.push(msg); }
     buf.reverse();
     for msg in buf {
+        // Dedup by message ID — never show the same message twice
+        if app.windows[win_idx].seen_msg_ids.contains(&msg.id()) { continue; }
         let ts = msg.date().with_timezone(&Local).format("%H:%M").to_string();
         let txt = msg.text().to_string();
+        let fwd_prefix = forward_origin_raw(&format!("{:?}", msg.raw))
+            .map(|n| format!("[Fwd: {}] ", n))
+            .unwrap_or_default();
+        let mid = if msg.media().is_some() {
+            let id = app.windows[win_idx].next_media_id;
+            app.windows[win_idx].next_media_id += 1;
+            id
+        } else { 0 };
         let display_txt = if txt.is_empty() {
             match msg.media() {
-                Some(m) => describe_media(&m),
-                None => continue, // truly empty, skip
+                Some(m) => format!("{}{}", fwd_prefix, describe_media(&m, mid)),
+                None => continue,
             }
         } else if msg.media().is_some() {
-            { let m = msg.media().unwrap(); format!("{} {}", describe_media(&m), txt) }
+            let m = msg.media().unwrap();
+            format!("{}{} {}", fwd_prefix, describe_media(&m, mid), txt)
         } else {
-            txt.clone()
+            format!("{}{}", fwd_prefix, txt)
         };
-        // Dedup only against real chat messages (not /names or /help sys output)
-        let already = app.windows[win_idx].lines.iter().rev()
-            .filter(|l| !l.is_sys)
-            .take(30)
-            .any(|l| l.ts == ts && l.text == display_txt);
-        if already { continue; }
         let sender = msg.sender().and_then(|s| s.name()).unwrap_or("Unknown").to_string();
         let (prefix, nick) = if msg.outgoing() {
             ("<You>".to_string(), Some("You".to_string()))
         } else {
             (format!("<{}>", sender), Some(sender))
         };
+        app.windows[win_idx].seen_msg_ids.insert(msg.id());
         app.windows[win_idx].lines.push_back(ChatLine {
-            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick,
+            ts, prefix, text: display_txt, is_sys: false, is_highlight: false, nick, media_id: mid,
         });
         while app.windows[win_idx].lines.len() > 2000 { app.windows[win_idx].lines.pop_front(); }
     }
@@ -1077,8 +1132,8 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                 let ts = Local::now().format("%H:%M").to_string();
                 app.windows[idx].lines.push_back(ChatLine {
                     ts, prefix: "***".to_string(), text: action_text,
-                    is_sys: true, is_highlight: false, nick: None,
-                });
+                    is_sys: true, is_highlight: false, nick: None, media_id: 0
+            });
             } else if is_msg && !msg_text.is_empty() {
                 app.push_sys(format!("-!- Messaging: {}", nm));
                 let _ = load_history(client, app, idx, 100).await;
@@ -1087,11 +1142,8 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
                     None => { app.push_sys("-!- Could not resolve peer."); return Ok(()); }
                 };
                 client.send_message(peer_ref, msg_text.clone()).await?;
-                let ts = Local::now().format("%H:%M").to_string();
-                app.windows[idx].lines.push_back(ChatLine {
-                    ts, prefix: "<You>".to_string(), text: msg_text,
-                    is_sys: false, is_highlight: false, nick: Some("You".to_string()),
-                });
+                let peer_id = app.windows[idx].peer.id();
+                app.pending_sends.insert(format!("{:?}::{}", peer_id, msg_text));
             } else {
                 app.push_sys(format!("-!- Joining: {}", nm));
                 let _ = load_history(client, app, idx, 100).await;
@@ -1113,8 +1165,93 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             let ts = Local::now().format("%H:%M").to_string();
             app.windows[ai].lines.push_back(ChatLine {
                 ts, prefix: "***".to_string(), text: action,
-                is_sys: true, is_highlight: false, nick: None,
+                is_sys: true, is_highlight: false, nick: None, media_id: 0
             });
+        }
+        return Ok(());
+    }
+
+    // /download [id] — list recent media or download by index
+    // /download      → list last 10 media items with IDs
+    // /download N    → download item N from that list
+    if text == "/download" || text.starts_with("/download ") {
+        let win_idx = match app.active {
+            Some(i) => i,
+            None => { app.push_sys("-!- /download requires an active window."); return Ok(()); }
+        };
+        let target_id: Option<usize> = text.strip_prefix("/download ")
+            .and_then(|s| s.trim().parse().ok());
+
+        let peer = app.windows[win_idx].peer.clone();
+        let peer_ref = match peer.to_ref().await {
+            Some(r) => r,
+            None => { app.push_sys("-!- Could not resolve peer."); return Ok(()); }
+        };
+
+        // Match fetched messages to stored media_ids (window lines, newest-first reversed)
+        let mut win_ids: Vec<(u32, String)> = app.windows[win_idx].lines.iter()
+            .filter(|l| l.media_id > 0)
+            .map(|l| (l.media_id, l.text.clone()))
+            .collect();
+        win_ids.reverse(); // newest first to match API order
+        let mut it = client.iter_messages(peer_ref).limit(100);
+        let mut media_list: Vec<(usize, String, grammers_client::media::Media, String)> = Vec::new();
+        let mut seq = 0usize;
+        while let Some(msg) = it.next().await? {
+            if media_list.len() >= 10 { break; }
+            if msg.media().is_none() { continue; }
+            let media = msg.media().unwrap();
+            let ext = match &media {
+                grammers_client::media::Media::Photo(_)    => "jpg",
+                grammers_client::media::Media::Sticker(_)  => "webp",
+                grammers_client::media::Media::Document(d) => match d.mime_type().unwrap_or("") {
+                    mt if mt.starts_with("video/") => "mp4",
+                    mt if mt.starts_with("audio/") => "ogg",
+                    "image/gif"  => "gif",
+                    "image/webp" => "webp",
+                    _ => "bin",
+                },
+                _ => continue,
+            };
+            let (id, label) = win_ids.get(seq)
+                .map(|(id, lbl)| (*id as usize, lbl.clone()))
+                .unwrap_or_else(|| (0, describe_media(&media, 0)));
+            let ts_str = msg.date().with_timezone(&Local).format("%Y%m%d_%H%M%S").to_string();
+            media_list.push((id, label, media, format!("tg_media_{}_{}.{}", id, ts_str, ext)));
+            seq += 1;
+        }
+
+        if media_list.is_empty() {
+            app.push_sys("-!- No recent media found in this window.");
+            return Ok(());
+        }
+
+        if let Some(target) = target_id {
+            // Download specific ID
+            if let Some((_, label, media, filename)) = media_list.into_iter().find(|(id, _, _, _)| *id == target) {
+                app.push_sys(format!("-!- Downloading {} → {}...", label, filename));
+                let path = std::path::PathBuf::from(&filename);
+                match client.download_media(&media, &path).await {
+                    Ok(_) => {
+                        app.push_sys(format!("-!- Saved: {}", filename));
+                        #[cfg(windows)]
+                        { let _ = std::process::Command::new("cmd").args(["/C", "start", "", &filename]).spawn(); }
+                        #[cfg(target_os = "macos")]
+                        { let _ = std::process::Command::new("open").arg(&filename).spawn(); }
+                        #[cfg(target_os = "linux")]
+                        { let _ = std::process::Command::new("xdg-open").arg(&filename).spawn(); }
+                    }
+                    Err(e) => { app.push_sys(format!("-!- Download failed: {}", e)); }
+                }
+            } else {
+                app.push_sys(format!("-!- No media with id {}. Run /download to list.", target));
+            }
+        } else {
+            // List mode
+            app.push_sys("-!- Recent media (use /download N to save):");
+            for (id, label, _, filename) in &media_list {
+                app.push_sys(format!("-!-   {} — {} → {}", id, label, filename));
+            }
         }
         return Ok(());
     }
@@ -1170,11 +1307,8 @@ async fn handle_command(client: &Client, app: &mut App, text: String) -> Result 
             None => { app.push_sys("-!- Could not resolve peer."); return Ok(()); }
         };
         client.send_message(peer_ref, text.clone()).await?;
-        let ts = Local::now().format("%H:%M").to_string();
-        app.windows[ai].lines.push_back(ChatLine {
-            ts, prefix: "<You>".to_string(), text,
-            is_sys: false, is_highlight: false, nick: Some("You".to_string()),
-        });
+        let peer_id = app.windows[ai].peer.id();
+        app.pending_sends.insert(format!("{:?}::{}", peer_id, text));
     } else {
         app.push_sys("-!- No active window. /join <n> or /win 2");
     }
@@ -1409,12 +1543,12 @@ async fn main() -> Result {
                             let raw = message.text().to_string();
                             if raw.is_empty() {
                                 match message.media() {
-                                    Some(m) => describe_media(&m),
+                                    Some(m) => describe_media(&m, 0),
                                     None => "[empty]".to_string(),
                                 }
                             } else { raw }
                         };
-                        let msg_id = message.id();
+                        let _msg_id = message.id();
                         // Find in active window and update in-place
                         if let Some(wi) = app.windows.iter().position(|w| w.peer.id() == chat_id) {
                             // We don't store message IDs, so find by matching old text prefix
@@ -1441,26 +1575,28 @@ async fn main() -> Result {
                     let chat_id   = from_peer.id();
                     let ts        = message.date().with_timezone(&Local).format("%H:%M").to_string();
                     let raw_txt   = message.text().to_string();
+                    let fwd_prefix = forward_origin_raw(&format!("{:?}", message.raw))
+                        .map(|n| format!("[Fwd: {}] ", n))
+                        .unwrap_or_default();
                     let txt = if raw_txt.is_empty() {
                         match message.media() {
-                            Some(m) => describe_media(&m),
-                            None    => continue, // truly empty update, skip
+                            Some(m) => format!("{}{}", fwd_prefix, describe_media(&m, 0)),
+                            None    => continue,
                         }
                     } else if message.media().is_some() {
-                        { let m = message.media().unwrap(); format!("{} {}", describe_media(&m), raw_txt) }
+                        let m = message.media().unwrap();
+                        format!("{}{} {}", fwd_prefix, describe_media(&m, 0), raw_txt)
                     } else {
-                        raw_txt
+                        format!("{}{}", fwd_prefix, raw_txt)
                     };
                     let highlight = message.mentioned();
+                    let has_media = message.media().is_some();
 
                     if message.outgoing() {
-                        // Find or create a window. Self-chat messages are always
-                        // outgoing, so we must create the window here too.
                         let win_idx = app.windows.iter().position(|w| w.peer.id() == chat_id);
                         let i = if let Some(i) = win_idx {
                             i
                         } else {
-                            // New window (e.g. Saved Messages / self-chat)
                             app.add_peer(from_peer.clone());
                             let name = from_peer.name().unwrap_or("Saved Messages").to_string();
                             app.windows.push(Window {
@@ -1469,25 +1605,32 @@ async fn main() -> Result {
                                 unread: 0,
                                 activity: WindowActivity::None,
                                 lines: VecDeque::new(),
-                                nicks: Vec::new(),
+                                nicks: Vec::new(), next_media_id: 1, seen_msg_ids: HashSet::new(),
                             });
                             let new_idx = app.windows.len() - 1;
-                            // Load history so context is visible
                             let _ = load_history(&client, &mut app, new_idx, 100).await;
                             app.save_windows();
                             new_idx
                         };
-                        // Dedup: skip only if this exact text is already the last line
-                        // AND that line was added by us locally (not loaded from history).
-                        // Compare by text only — ts has minute precision and would swallow
-                        // fast consecutive messages.
-                        let already = app.windows[i].lines.back()
-                            .map(|l| l.prefix == "<You>" && l.text == txt && l.is_sys == false)
-                            .unwrap_or(false);
-                        if !already {
+                        let peer_id = app.windows[i].peer.id();
+                        // For dedup, match against raw_txt (before fwd_prefix).
+                        // Forwards and media sends won't be in pending_sends, so they always show.
+                        let was_pending = app.pending_sends.remove(&format!("{:?}::{}", peer_id, raw_txt));
+                        if !was_pending {
+                            let mid = if has_media {
+                                let id = app.windows[i].next_media_id;
+                                app.windows[i].next_media_id += 1;
+                                id
+                            } else { 0 };
+                            let final_txt = if mid > 0 {
+                                txt.replace("#0]", &format!("#{}]", mid))
+                            } else { txt };
+                            let msg_id = message.id();
+                            if app.windows[i].seen_msg_ids.contains(&msg_id) { continue; }
+                            app.windows[i].seen_msg_ids.insert(msg_id);
                             app.windows[i].lines.push_back(ChatLine {
-                                ts, prefix: "<You>".to_string(), text: txt,
-                                is_sys: false, is_highlight: false, nick: Some("You".to_string()),
+                                ts, prefix: "<You>".to_string(), text: final_txt,
+                                is_sys: false, is_highlight: false, nick: Some("You".to_string()), media_id: mid
                             });
                             while app.windows[i].lines.len() > 2000 {
                                 app.windows[i].lines.pop_front();
@@ -1498,7 +1641,7 @@ async fn main() -> Result {
                             .and_then(|s| s.name())
                             .unwrap_or("Unknown")
                             .to_string();
-                        app.push_incoming(&from_peer, ts, sender, txt, highlight);
+                        app.push_incoming(&from_peer, message.id(), ts, sender, txt, highlight);
                         app.save_windows();
                     }
                 }

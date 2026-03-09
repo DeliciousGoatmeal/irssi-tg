@@ -1,5 +1,8 @@
-ACTIVE=0
+ACTIVE=2
 -1002913367769|Pupifer's Bad Dog (21+ & NSFW)
 726129703|Mikaroni (Enticer of tastebuds) ΘΔ
 -1003399583177|Halcyon Underground Community
+5076695048|Canteelo
 8122362766|🦊+ 🐈= 📠
+-1001359253155|Washington Puget Sound Furs
+-1001865458423|The Monkey Kingdom🐒🏰⛓️
